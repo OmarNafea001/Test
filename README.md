@@ -1,29 +1,83 @@
-#!/bin/bash
+شرح سكريبت الـ Expiry Date Mismatch
+الفكرة في جملة
 
-$ORACLE_HOME/bin/sqlplus -s <<END
-RP7VFEPIDAT/RP7VFEPIDAT@$GLOBAL_DB_ORACLE_SERVICE
-INSERT INTO rd_t_pcrf_expiry_date_mismatch
-SELECT  /*+ PARALLEL(16) */
-DISTINCT to_date(pcrf.RUN_DATE, 'YYYYMMDD') RUN_DATE,
-pcrf.msisdn , LISTAGG(service_name, ',') WITHIN GROUP (ORDER BY service_name)SERVICE_NAME,
-Trunc(TO_DATE(VALID_DATE , 'YYYYMMDDHH24MISS'))VALID_DATE,
-Trunc(TO_DATE(EXPIRY_DATE, 'YYYYMMDDHH24MISS'))EXPIRY_DATE
-FROM RP7VFEPIDAT.PFM_PCRF_STG_FILTERED pcrf
-LEFT OUTER JOIN RP7VFEPIDAT.PFM_BSCS_ADSL_STG billing
-ON pcrf.MSISDN = billing.msisdn
-WHERE ((billing."TYPE" like '%PRE%' AND service_name NOT LIKE '%Th%' AND service_name NOT LIKE '%OnHold%')
-OR (billing."TYPE" like '%POST%' AND service_name IN (SELECT DISTINCT pcrf_service_name
-FROM RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE WHERE (FREQUENCY LIKE '%OnDemand%'
-AND (prod_Type_name = 'Addon' OR prod_Type_name = 'DSL Promotion') AND PCRF_SERVICE_NAME NOT LIKE '%_R%' AND PCRF_TYPE LIKE '%POSTPAID%'))))
-AND ( EXPIRY_DATE IS NULL OR TO_DATE(EXPIRY_DATE , 'YYYYMMDDHH24MISS') < TRUNC(SYSDATE)-1)
-AND PCRF.CUSTOMER_STATUS = '1'
-AND service_name NOT LIKE '%Th%' AND service_name NOT LIKE '%OnHold%'
-AND BILLING.PRICE_GROUP NOT IN ('TEST PHONES',
-                                                                'Pre-paid Test SIM',
-                                                                'Test Individuals',
-                                                                'Dummy PG'
-                                                           )
-GROUP BY pcrf.RUN_DATE , pcrf.MSISDN,VALID_DATE,EXPIRY_DATE;
-COMMIT;
-exit;
-END
+"بنفتش على العملاء الـ Active اللي لسه عندهم خدمة شغالة على PCRF رغم إن تاريخ انتهائها عدّى (أو مفيش تاريخ انتهاء أصلاً)، وبنسجلهم في جدول الـ Mismatch."
+
+يعني الخدمة المفروض تكون اتقفلت، لكنها لسه شغالة على PCRF.
+
+الخطوات بالترتيب
+1) الاتصال والـ Hint
+RP7VFEPIDAT/RP7VFEPIDAT@$GLOBAL_DB_ORACLE_SERVICE: بيتصل بالداتابيز، واسم الـ Service جاي من environment variable. الـ username/password مكتوبين صريحين في السكريبت (ملاحظة أمان زي السكريبت الأول).
+/*+ PARALLEL(16) */: بيقول لـ Oracle يستخدم 16 عملية متوازية عشان الـ query تخلص أسرع.
+2) مصادر الداتا
+الجدول	بيوفر إيه
+PFM_PCRF_STG_FILTERED (pcrf)	الخدمات الشغالة على PCRF لكل MSISDN، مع الـ VALID_DATE والـ EXPIRY_DATE وحالة العميل
+PFM_BSCS_ADSL_STG (billing)	نوع العميل من الـ Billing (Prepaid/Postpaid) والـ Price Group
+RD_T_DSL_PRODUCT_CATALOGUE	قائمة الـ Add-ons اللي بنفحصها للـ Postpaid
+3) فلتر نوع العميل (أول جزء في الـ WHERE)
+
+فيه فرعين بينهم OR:
+
+أ) عميل Prepaid (billing.TYPE like '%PRE%')
+
+بناخد كل خدماته عدا اللي اسمها فيه Th (Throttle) أو OnHold.
+
+ب) عميل Postpaid (billing.TYPE like '%POST%')
+
+مش بناخد كل خدماته، بناخد بس الخدمات اللي موجودة في قائمة من الـ Catalogue بالشروط دي:
+FREQUENCY فيها OnDemand (خدمات بتتشترى عند الطلب)
+نوع المنتج Addon أو DSL Promotion
+الاسم مفيهوش _R
+نوع الـ PCRF فيه POSTPAID
+
+الفكرة إن الـ Postpaid الباقة الأساسية بتتجدد شهرياً من غير تاريخ انتهاء بنفس المعنى، فبنركز بس على الإضافات اللي ليها صلاحية محددة.
+
+4) فلتر تاريخ الانتهاء (قلب الـ Mismatch)
+sql
+AND (EXPIRY_DATE IS NULL OR TO_DATE(EXPIRY_DATE,'YYYYMMDDHH24MISS') < TRUNC(SYSDATE)-1)
+
+الخدمة بتتسجل لو:
+
+مفيهاش تاريخ انتهاء (فاضي)، أو
+تاريخ انتهائها قبل بداية امبارح (TRUNC(SYSDATE)-1 = امبارح الساعة 12 بالليل).
+
+يعني فيه فترة سماح يوم تقريباً: الخدمة اللي انتهت النهاردة أو امبارح مبتتسجلش، عشان يدوا النظام وقت يقفلها.
+
+5) فلاتر إضافية
+CUSTOMER_STATUS = '1': العملاء الـ Active بس.
+استبعاد Th و OnHold (تاني، وده بيطبق على الـ Postpaid كمان).
+استبعاد خطوط التست: TEST PHONES, Pre-paid Test SIM, Test Individuals, Dummy PG.
+6) التجميع (GROUP BY + LISTAGG)
+
+بنجمع لكل (تاريخ التشغيل + MSISDN + VALID_DATE + EXPIRY_DATE) في صف واحد، وأسماء الخدمات بتتحط جنب بعض بفاصلة:
+
+قبل التجميع	بعد التجميع
+0100 / Addon_A / 2026-09-01	0100 / Addon_A,Addon_B / 2026-09-01
+0100 / Addon_B / 2026-09-01	
+
+والتواريخ بتتحول لتاريخ بدون ساعة (TRUNC).
+
+مثال
+
+النهاردة 19 أكتوبر، وحد أدنى للقبول = بداية 18 أكتوبر:
+
+العميل	النوع	الخدمة	Expiry	النتيجة
+A	Prepaid	Addon_X	10 أكتوبر	✅ بيتسجل (انتهت من أكتر من يوم)
+B	Prepaid	Addon_Y	18 أكتوبر 10:00	❌ مش بيتسجل (فترة سماح)
+C	Prepaid	Addon_Z	فاضي	✅ بيتسجل (مفيش تاريخ)
+D	Prepaid	Throttle_1	1 أكتوبر	❌ مستبعد (Throttle)
+E	Postpaid	باقة أساسية	1 أكتوبر	❌ مش في قائمة الـ On-Demand
+⚠️ ملاحظات لازم تنتبه لها
+الـ LEFT JOIN عملياً بقى INNER JOIN. شروط الـ WHERE على billing.TYPE وPRICE_GROUP بتشيل أي عميل مالوش صف في الـ Billing. لو فيه عملاء على PCRF من غير Billing record، هما مش بيظهروا خالص.
+'%_R%' غالباً مش بيعمل اللي المطلوب. في LIKE علامة _ معناها "أي حرف واحد"، فالشرط بيستبعد أي اسم فيه حرف R كبير بعد أول حرف، مش بس اللي فيه _R. لو القصد الـ underscore الحرفي لازم يتكتب LIKE '%\_R%' ESCAPE '\'. راجع مع اللي كتبه.
+'%Th%' واسع. هيستبعد أي خدمة فيها Th في أي مكان في اسمها، مش بس الـ Throttle.
+'%PRE%' و'%POST%' ممكن يتقابلوا مع قيمة زي PREPAID-POSTPAID، فالعميل ممكن يدخل في الفرعين. اتأكد من القيم الفعلية في billing.TYPE.
+الـ DISTINCT زيادة لأن الـ GROUP BY بيعمل نفس الشغل.
+الـ GROUP BY على التواريخ الخام بينما الـ SELECT بيعمل TRUNC، فلو نفس اليوم بساعات مختلفة هيطلع صفين متشابهين في الظاهر.
+الـ LISTAGG لو الاسم المجمع عدى 4000 حرف هيطلع error ORA-01489.
+مفيش عمود تحديد لأي جدول جاي منه VALID_DATE وEXPIRY_DATE. الأرجح من PCRF، بس اتأكد.
+للبيزنس بجملة واحدة
+
+"بنكتشف العملاء اللي خدماتهم انتهت صلاحيتها (أو مفيهاش تاريخ انتهاء) لكنها لسه شغالة على PCRF، بعد استبعاد خطوط التست والـ Throttle، مع فترة سماح يوم."
+
+لو حابب، أكتبلك السكريبت ده بنفس الطريقة المنظمة بالكومنتات، أو أجهزلك نسخة تصحح النقط اللي فوق.
