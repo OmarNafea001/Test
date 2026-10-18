@@ -1,107 +1,29 @@
-الشرح البسيط
+#!/bin/bash
 
-الفكرة كلها في 3 خطوات:
-
-المفروض: كل باقة ليها كوتا متوقعة في الـ Lookup (وفي الـ Prepaid Main Bundle بتتضاف عليها كوتا الضريبة).
-الفعلي: بنشوف العميل الـ Active واخد كام على PCRF.
-الفرق: لو الفعلي ≠ المتوقع، بنسجل العميل كـ Mismatch Case. بعد كده بنحسب نسبة العملاء دول من إجمالي القاعدة.
-
-والإشارة بتفرق: موجب يعني العميل أخد زيادة (خسارة إيراد محتملة)، وسالب يعني أخد أقل (تجربة عميل سيئة).
-
-النص الجاهز للبيزنس
-
-الموضوع: شرح آلية مراقبة اختلاف استهلاك الكوتا على PCRF (Quota Mismatch)
-
-مرحباً فريق البيزنس،
-
-أرفق لكم شرحاً مبسطاً لآلية الفحص اليومي لكوتا العملاء على PCRF.
-
-الهدف
-اكتشاف العملاء اللي الكوتا الفعلية بتاعتهم على النظام مختلفة عن الكوتا المفروض ياخدوها حسب باقتهم، لأن:
-
-لو أخدوا أكتر من حقهم ← خسارة إيراد محتملة
-لو أخدوا أقل ← تأثير سلبي على تجربة العميل
-
-إزاي بيشتغل (يومياً)
-
-بناخد العملاء الـ Active فقط.
-لكل عميل وباقة، بنقارن الكوتا الفعلية بـ الكوتا المتوقعة من الـ Lookup (وبنضيف كوتا الضريبة في حالة Prepaid Main Bundle).
-لو فيه فرق، العميل بيتسجل كـ Mismatch Case مع حجم الفرق.
-بنحسب عدد العملاء اللي فيهم مشكلة ونسبتهم من إجمالي القاعدة، موزعين حسب النوع (Prepaid / Postpaid).
-
-مثال
-باقة Prepaid Main Bundle كوتاها المتوقعة 10 والضريبة 1:
-
-الفعلي 10 أو 11 ← سليم
-الفعلي 12 ← فرق +1 (أخد زيادة)
-الفعلي 8 ← فرق -3 (أخد أقل)
-
-الحالات المستبعدة (مش بتتحسب كمشكلة)
-
-خدمات Throttle و Gift و Promo
-العملاء اللي اشتروا نفس الباقة أكتر من مرة (الكوتا = 2× أو 3× أو 4× أو 5× المتوقع)، لأن ده سلوك طبيعي
-العملاء غير الـ Active
-
-المخرجات
-جدول يومي فيه: التاريخ، النوع، عدد العملاء اللي فيهم مشكلة، إجمالي القاعدة، والنسبة.
-
-ملاحظات على حدود الحل
-
-النسبة محسوبة من إجمالي القاعدة كلها، يعني هي حصة كل نوع من إجمالي القاعدة وليست نسبة المشاكل داخل النوع نفسه.
-الخدمات اللي مش متغطية في الـ Lookup (كوتاتها صفر) مش بتتقارن بشكل صحيح.
-حالات خدمة الـ Double Quota مستبعدة حالياً من النتائج، ومحتاجين نراجع لو حابين نضمها.
-
-لو حابين تفاصيل أكتر أو مثال على الأرقام الفعلية، أنا جاهز.
-
-تحياتي
-
-عدّل الأسماء والتفاصيل زي ما تحب. لو عايز أطلعهالك في ملف Word أو عرض PowerPoint، أو أضيف Flow Diagram بسيط للمسار، قولي.
-
-حابب تشرحلي الجزء بتاع ال double quota
-
-الـ Double Quota ببساطة
-الفكرة
-
-فيه خدمة اسمها Serv_DSL_Double_Quota_Pre، معناها: العميل المفروض ياخد ضعف كوتا باقته الأساسية (Main Bundle).
-
-يعني لو باقته 10 جيجا ومعاه Double، المفروض يبقى مجموع كوتاه 20 جيجا.
-
-إزاي بنتأكد؟
-
-لكل عميل عنده Double بنجيب رقمين:
-
-(أ) مجموع كوتا Main + Double
-(ب) كوتا الـ Main لوحدها
-
-وبنقارن (أ) بـ (ب × 2).
-
-3 عملاء كمثال
-
-باقة الـ Main عند الكل 10 جيجا، فالمفروض المجموع = 20:
-
-العميل	Main	Double	المجموع (أ)	المفروض (ب×2)	النتيجة
-A	10	10	20	20	سليم، مش بيتسجل
-B	10	5	15	20	Customer Experience (أخد أقل من حقه)
-C	10	15	25	20	Revenue Loss (أخد أكتر من حقه)
-المشكلة التقنية: الرقمين في صفين مختلفين
-
-بيانات العميل في الجدول بتبقى كده:
-
-MSISDN	SERVICE	QUOTA
-B	Main_10GB	10
-B	Serv_DSL_Double_Quota_Pre	5
-
-فالـ query بتعمل ده بالترتيب:
-
-MAIN_PLUS_DOUBLE: بتجمع الصفين لكل عميل فيطلع B = 15. وبتشترط إن العميل عنده صفين بالظبط (Main واحد + Double واحد).
-MAIN_ONLY: بتجيب كوتا الـ Main لوحدها فيطلع B = 10.
-DOUBLE_SUM (الـ JOIN): بتربط الاتنين على رقم العميل فيطلع صف واحد B | 15 | 10.
-الـ CASE: بيقارن 15 بـ 10 × 2 ويطلع التصنيف.
-⚠️ المشكلة اللي لازم تعرفها
-
-الجزء ده كله مش شغال فعلياً في النتيجة النهائية. السبب إن الفلتر service_name NOT LIKE '%Double%' بيشيل خدمة الـ Double نفسها قبل ما التصنيف يظهر. يعني:
-
-عمود Double_Quota_Cases هيطلع دايماً NOT Double Quota Case
-العملاء B و C في المثال مش هيتسجلوا رغم إنهم فيهم مشكلة
-
-لو البيزنس عايز يتابع حالات الـ Double، لازم نعدل الفلتر ده. ممكن أعدله لك وأجهزلك النسخة المصححة، وأضيف طريقة بسيطة تتأكد بيها إن النتيجة صح.
+$ORACLE_HOME/bin/sqlplus -s <<END
+RP7VFEPIDAT/RP7VFEPIDAT@$GLOBAL_DB_ORACLE_SERVICE
+INSERT INTO rd_t_pcrf_expiry_date_mismatch
+SELECT  /*+ PARALLEL(16) */
+DISTINCT to_date(pcrf.RUN_DATE, 'YYYYMMDD') RUN_DATE,
+pcrf.msisdn , LISTAGG(service_name, ',') WITHIN GROUP (ORDER BY service_name)SERVICE_NAME,
+Trunc(TO_DATE(VALID_DATE , 'YYYYMMDDHH24MISS'))VALID_DATE,
+Trunc(TO_DATE(EXPIRY_DATE, 'YYYYMMDDHH24MISS'))EXPIRY_DATE
+FROM RP7VFEPIDAT.PFM_PCRF_STG_FILTERED pcrf
+LEFT OUTER JOIN RP7VFEPIDAT.PFM_BSCS_ADSL_STG billing
+ON pcrf.MSISDN = billing.msisdn
+WHERE ((billing."TYPE" like '%PRE%' AND service_name NOT LIKE '%Th%' AND service_name NOT LIKE '%OnHold%')
+OR (billing."TYPE" like '%POST%' AND service_name IN (SELECT DISTINCT pcrf_service_name
+FROM RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE WHERE (FREQUENCY LIKE '%OnDemand%'
+AND (prod_Type_name = 'Addon' OR prod_Type_name = 'DSL Promotion') AND PCRF_SERVICE_NAME NOT LIKE '%_R%' AND PCRF_TYPE LIKE '%POSTPAID%'))))
+AND ( EXPIRY_DATE IS NULL OR TO_DATE(EXPIRY_DATE , 'YYYYMMDDHH24MISS') < TRUNC(SYSDATE)-1)
+AND PCRF.CUSTOMER_STATUS = '1'
+AND service_name NOT LIKE '%Th%' AND service_name NOT LIKE '%OnHold%'
+AND BILLING.PRICE_GROUP NOT IN ('TEST PHONES',
+                                                                'Pre-paid Test SIM',
+                                                                'Test Individuals',
+                                                                'Dummy PG'
+                                                           )
+GROUP BY pcrf.RUN_DATE , pcrf.MSISDN,VALID_DATE,EXPIRY_DATE;
+COMMIT;
+exit;
+END
