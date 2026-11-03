@@ -1,157 +1,277 @@
--- =====================================================================
--- PCRF base customers that do NOT exist on the TE invoice
---   Invoice run date : 20261001  (start of month)
---   Invoice month    : 01/09/2026 -> 30/09/2026
---   PCRF base        : every MSISDN with a Main Bundle service in PCRF
---                      from 01/09 to 30/09, one row each = the FIRST day
---                      it has that service
---
---   Dates are written as literals (not a params table) so Oracle can
---   prune partitions directly. To run another month, find & replace:
---       20260901  -> first day of the invoice month
---       20261001  -> invoice run date (first day of the next month)
--- =====================================================================
+ALTER SESSION ENABLE PARALLEL QUERY;
 
-
--- =====================================================================
--- QUERY 1 : DETAIL  (one row per missing MSISDN)
--- =====================================================================
-WITH
--- 1) PCRF base: first day in the month with a Main Bundle service
---    (aggregate KEEP FIRST instead of ROW_NUMBER -> no big window sort)
-pcrf_base AS (
-    SELECT /*+ MATERIALIZE PARALLEL(p 64) FULL(p) */
-           p.MSISDN,
-           MIN(p.RUN_DATE) AS FIRST_PCRF_DATE,
-           MAX(p.SERVICE_NAME) KEEP (DENSE_RANK FIRST ORDER BY p.RUN_DATE) AS PCRF_SERVICE_NAME,
-           MAX(UPPER(DECODE(p.CUSTOMER_STATUS, 0, 'DeActive', 1, 'Active',
-                                               2, 'Suspended', 3, 'On-Hold',
-                                               p.CUSTOMER_STATUS)))
-               KEEP (DENSE_RANK FIRST ORDER BY p.RUN_DATE) AS PCRF_STATUS
-    FROM RP7VFEPIDAT.PFM_PCRF_FILTERED p
-    WHERE p.RUN_DATE >= TO_DATE('20260901','YYYYMMDD')
-      AND p.RUN_DATE <  TO_DATE('20261001','YYYYMMDD')
-      AND p.SERVICE_NAME IS NOT NULL
-      AND p.PACKAGE_TYPE = 'Main Bundle'
-      AND p.SERVICE_NAME NOT IN ('Serv_DSL_Generic_Promo',
-                                 'Serv_DSL_Compensation_Gift',
-                                 'Serv_DSL_Throttling',
-                                 'ADSL_OnHold',
-                                 'Serv_DSL_Double_Quota_Pre')
-      AND p.SERVICE_NAME NOT LIKE '%Add%'
-      AND p.SERVICE_NAME NOT LIKE '%DoubleQuota%'
-    GROUP BY p.MSISDN
+WITH params AS (
+    SELECT /*+ PARALLEL(f 32) */ TRUNC(MAX(f.RUN_DATE)) AS ref_date
+    FROM   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
 ),
 
--- 2) SDSL and Cloud customers to exclude (tariff description from BSCS)
-sdsl_cloud AS (
-    SELECT /*+ MATERIALIZE PARALLEL(b 64) */ DISTINCT b.MSISDN
-    FROM RP7VFEPIDAT.PFM_BSCS_ADSL b
-    WHERE b.RUN_DATE = 20261001
-      AND (b.TMCODE_DES LIKE 'SDSL%' OR b.TMCODE_DES LIKE 'Cloud%')
+cycles AS (
+    -- bc = bill cycle, e = END day of cycle (31 = last day of month -> LAST_DAY handles 28/29/30/31)
+    SELECT '01' AS bc, 31 AS e FROM dual UNION ALL
+    SELECT '02',       15      FROM dual UNION ALL   -- 16 -> 15
+    SELECT '04',        3      FROM dual UNION ALL   -- 4  -> 3
+    SELECT '07',        6      FROM dual UNION ALL   -- 7  -> 6
+    SELECT '09',       20      FROM dual UNION ALL   -- 21 -> 20 (to be confirmed)
+    SELECT '11',       10      FROM dual UNION ALL   -- 11 -> 10
+    SELECT '25',       24      FROM dual             -- 25 -> 24
 ),
 
--- 3) Everyone on the TE invoice during the invoice month
-te_invoice AS (
-    SELECT /*+ MATERIALIZE PARALLEL(t 64) FULL(t) */ DISTINCT t.MSISDN
-    FROM RP7VFEPIDAT.RD_T_TE_DATA_BASE_HISTORICAL t
-    WHERE t.RUN_DATE >= TO_DATE('20260901','YYYYMMDD')
-      AND t.RUN_DATE <  TO_DATE('20261001','YYYYMMDD')
+-- >>> CHOOSE THE BILL CYCLES TO RUN HERE <<<
+cycle_sel AS (
+    SELECT bc, e
+    FROM   cycles
+    WHERE  bc IN ('01','02','04','07','09','11','25')            -- e.g. ('01') or ('01','07','25')
 ),
 
--- 4) Base customers missing from the TE invoice (hash anti-joins)
-missing AS (
-    SELECT /*+ MATERIALIZE PARALLEL(64) */
-           pb.MSISDN, pb.FIRST_PCRF_DATE, pb.PCRF_SERVICE_NAME, pb.PCRF_STATUS
-    FROM pcrf_base pb
-    WHERE NOT EXISTS (SELECT /*+ HASH_AJ */ 1 FROM sdsl_cloud s WHERE s.MSISDN = pb.MSISDN)
-      AND NOT EXISTS (SELECT /*+ HASH_AJ */ 1 FROM te_invoice te WHERE te.MSISDN = pb.MSISDN)
+cycle_cand AS (
+    SELECT c.bc, c.e, p.ref_date,
+           CASE WHEN c.e = 31
+                THEN LAST_DAY(TRUNC(p.ref_date,'MM'))
+                ELSE TRUNC(p.ref_date,'MM') + c.e - 1 END                 AS end_this_month,
+           CASE WHEN c.e = 31
+                THEN LAST_DAY(ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1))
+                ELSE ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1) + c.e - 1 END  AS end_prev_month
+    FROM   cycle_sel c CROSS JOIN params p
 ),
 
--- 5) Service name from QUOTA_NAME_LKP on the run date (01/10, the only date it has)
-quota AS (
-    SELECT /*+ PARALLEL(q 64) */ q.MSISDN, MAX(q.QUOTA_NAME) AS QUOTA_NAME
-    FROM RP7VFEPIDAT.QUOTA_NAME_LKP q
-    WHERE q."TIME" = TO_DATE('20261001','YYYYMMDD')
-    GROUP BY q.MSISDN
+cycle_win AS (
+    SELECT bc, cycle_end,
+           CASE WHEN e = 31 THEN TRUNC(cycle_end,'MM')
+                ELSE ADD_MONTHS(cycle_end,-1) + 1 END AS cycle_start
+    FROM (
+        SELECT bc, e,
+               CASE WHEN end_this_month <= ref_date
+                    THEN end_this_month ELSE end_prev_month END AS cycle_end
+        FROM cycle_cand
+    )
 ),
 
--- 6) Consumption during the invoice month, only for the missing MSISDNs
---    EDRS MSISDN has no '20' prefix, so it is added here to match PCRF/TE
-consumption AS (
-    SELECT /*+ PARALLEL(e 64) FULL(e) */
-           '20' || e.MSISDN   AS MSISDN,
-           SUM(e.QUOTA_USAGE) AS TOTAL_USAGE
-    FROM RP7VFEPIDAT.PFM_PCRF_EDRS_STG_CONSUM e
-    WHERE e.RUN_DATE >= TO_DATE('20260901','YYYYMMDD')
-      AND e.RUN_DATE <  TO_DATE('20261001','YYYYMMDD')
-      AND e.SERVICE_NAME NOT LIKE '%Promo%'
-      AND e.SERVICE_NAME NOT LIKE '%Gift%'
-      AND e.SERVICE_NAME NOT LIKE '%Add%'
-      AND EXISTS (SELECT /*+ HASH_SJ */ 1 FROM missing m WHERE m.MSISDN = '20' || e.MSISDN)
-    GROUP BY '20' || e.MSISDN
+bounds AS (
+    SELECT MIN(cycle_start) AS min_start, MAX(cycle_end) AS max_end
+    FROM   cycle_win
+),
+
+billing AS (
+    SELECT MSISDN, BILLCYCLE, PCRF_SERVICE_NAME_EXPECTED
+    FROM (
+        SELECT /*+ PARALLEL(b 32) */
+               b.MSISDN, b.BILLCYCLE, b.PCRF_SERVICE_NAME_EXPECTED,
+               b.TYPE, b.STATUS, b.PRICE_GROUP, b.TMCODE_DES,
+               ROW_NUMBER() OVER (PARTITION BY b.MSISDN ORDER BY b.RUN_DATE DESC) AS rn
+        FROM   RP7VFEPIDAT.PFM_BSCS_ADSL b
+        WHERE  b.TYPE   = 'POST'
+        AND    b.STATUS = 'ACTIVE'
+    )
+    WHERE rn = 1
+    AND   BILLCYCLE IN (SELECT bc FROM cycle_sel)
+    AND   NVL(PRICE_GROUP,'x') NOT IN ('TEST PHONES','Pre-paid Test SIM',
+                                       'Test Individuals','Dummy PG')
+    AND   UPPER(NVL(TMCODE_DES,'x')) NOT LIKE '%SDSL%'      -- exclude SDSL
+),
+
+-- postpaid Main Bundles only: used for catalogue quota AND as the list of valid PCRF services
+catalogue AS (
+    SELECT /*+ MATERIALIZE */
+           UPPER(TRIM(PCRF_SERVICE_NAME)) AS svc_key,
+           MAX(PCRF_QOUTA_VALUE_GB)       AS catalogue_quota_gb
+    FROM   RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE
+    WHERE  PROD_TYPE_NAME = 'Main Bundle'
+   -- AND    UPPER(PCRF_TYPE) = 'POSTPAID'
+    GROUP  BY UPPER(TRIM(PCRF_SERVICE_NAME))
+),
+
+subs AS (
+    SELECT /*+ MATERIALIZE */
+           b.MSISDN,
+           SUBSTR(b.MSISDN, 2) AS edr_msisdn,
+           b.BILLCYCLE,
+           w.cycle_start, w.cycle_end,
+           c.catalogue_quota_gb
+    FROM   billing b
+    JOIN   cycle_win w    ON w.bc = b.BILLCYCLE
+    LEFT JOIN catalogue c ON c.svc_key = UPPER(TRIM(b.PCRF_SERVICE_NAME_EXPECTED))
+),
+
+win_rows AS (
+    SELECT /*+ PARALLEL(f 32) USE_HASH(f) */
+           s.MSISDN,
+           f.SERVICE_NAME,
+           f.RUN_DATE,
+           f.QUOTA_SUM,
+           CASE WHEN LOWER(f.SERVICE_NAME) LIKE '%double%quota%' THEN 1 ELSE 0 END AS is_double
+    FROM   subs s
+    JOIN   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
+           ON  f.MSISDN   = s.MSISDN
+           AND f.RUN_DATE >= s.cycle_start
+           AND f.RUN_DATE <  s.cycle_end + 1
+    WHERE  f.RUN_DATE >= (SELECT min_start   FROM bounds)
+    AND    f.RUN_DATE <  (SELECT max_end + 1 FROM bounds)
+    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%addon%'
+    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%throttling%'
+	AND    LOWER(f.SERVICE_NAME) NOT LIKE '%promo%'
+	
+    -- validation: keep only services found in the postpaid Main Bundle catalogue
+    -- (double quota is kept by name, since it is not a Main Bundle)
+    AND   ( LOWER(f.SERVICE_NAME) LIKE '%double%quota%'
+            OR UPPER(TRIM(f.SERVICE_NAME)) IN (SELECT svc_key FROM catalogue) )
+),
+
+-- last quota value of each service in the cycle (not rounded yet)
+svc_last AS (
+    SELECT MSISDN, SERVICE_NAME, is_double,
+           MIN(RUN_DATE) AS first_dt,
+           MAX(RUN_DATE) AS last_dt,
+           MAX(QUOTA_SUM) KEEP (DENSE_RANK LAST ORDER BY RUN_DATE) / 1048576 AS svc_quota_gb
+    FROM   win_rows
+    GROUP  BY MSISDN, SERVICE_NAME, is_double
+),
+
+-- sum first, then round to whole GB
+quota_agg AS (
+    SELECT MSISDN,
+           ROUND(SUM(CASE WHEN is_double = 0 THEN svc_quota_gb END))  AS main_quota_gb,
+           COUNT(CASE WHEN is_double = 0 THEN 1 END)                  AS main_svc_cnt,
+           ROUND(SUM(CASE WHEN is_double = 1 THEN svc_quota_gb END))  AS double_quota_gb,
+           COUNT(CASE WHEN is_double = 1 THEN 1 END)                  AS double_svc_cnt,
+           MAX(CASE WHEN is_double = 0 THEN last_dt END)              AS main_last_date,
+           MAX(CASE WHEN is_double = 1 THEN last_dt END)              AS double_last_date,
+           LISTAGG(CASE WHEN is_double = 0 THEN SERVICE_NAME END, ' > ')
+               WITHIN GROUP (ORDER BY first_dt)                       AS main_services
+    FROM   svc_last
+    GROUP  BY MSISDN
+),
+
+edr_agg AS (
+    SELECT /*+ PARALLEL(e 32) USE_HASH(e) */
+           s.MSISDN,
+           ROUND(SUM(e.QUOTA_USAGE) / 1048576) AS cons_edr_gb,
+           COUNT(*)                            AS edr_sessions
+    FROM   subs s
+    JOIN   RP7VFEPIDAT.PFM_PCRF_EDRS_STG_CONSUM e
+           ON  e.MSISDN = s.edr_msisdn
+           AND e.TIME  >= s.cycle_start
+           AND e.TIME   < s.cycle_end + 1
+    WHERE  e.TIME >= (SELECT min_start   FROM bounds)
+    AND    e.TIME <  (SELECT max_end + 1 FROM bounds)
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%addon%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%throttling%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%promo%'
+	AND    LOWER(e.SERVICE_NAME) NOT LIKE '%adn%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%gift%'
+    GROUP  BY s.MSISDN
+),
+
+calc AS (
+    SELECT s.MSISDN, s.BILLCYCLE, s.cycle_start, s.cycle_end,
+           s.catalogue_quota_gb,
+           q.main_last_date, q.double_last_date,
+           q.main_services,
+           NVL(q.main_svc_cnt,0)                                 AS main_svc_cnt,
+           q.main_quota_gb,
+           NVL(q.double_quota_gb,0)                              AS double_quota_gb,
+           CASE WHEN NVL(q.double_svc_cnt,0) > 0 THEN 1 ELSE 0 END AS has_double,
+           NVL(q.main_quota_gb,0) + NVL(q.double_quota_gb,0)     AS allocated_gb,
+           NVL(e.cons_edr_gb,0)                                  AS cons_e,
+           NVL(e.edr_sessions,0)                                 AS edr_sessions
+    FROM   subs s
+    LEFT JOIN quota_agg q ON q.MSISDN = s.MSISDN    -- keeps customers with no PCRF data
+    LEFT JOIN edr_agg   e ON e.MSISDN = s.MSISDN
 )
 
-SELECT /*+ PARALLEL(64) USE_HASH(q c) */
-    m.MSISDN,
-    m.FIRST_PCRF_DATE,
-    m.PCRF_SERVICE_NAME,
-    m.PCRF_STATUS,
-    NVL(q.QUOTA_NAME, '_N')                         AS SERVICE_NAME,
-    REGEXP_SUBSTR(q.QUOTA_NAME, '[0-9]+M', 1, 1)    AS SPEED,
-    ROUND(NVL(c.TOTAL_USAGE, 0) / POWER(1024, 3))   AS CONSUMPTION_GB
-FROM missing m
-LEFT JOIN quota       q ON q.MSISDN = m.MSISDN
-LEFT JOIN consumption c ON c.MSISDN = m.MSISDN
-ORDER BY CONSUMPTION_GB DESC;
+SELECT MSISDN,
+       BILLCYCLE,
+       cycle_start,
+       cycle_end,
+       TO_CHAR(cycle_end,'YYYY-MM')                                   AS cycle_month,
+       TO_CHAR(cycle_end,'FMMonth YYYY','NLS_DATE_LANGUAGE=ENGLISH')  AS cycle_month_name,
+
+       CASE WHEN main_svc_cnt > 1 THEN 'Yes' ELSE 'No' END            AS service_changed,
+       main_svc_cnt                                                   AS main_services_count,
+       main_services,
+
+       main_last_date                                                 AS main_quota_date,
+       main_quota_gb,
+       CASE WHEN has_double = 1 THEN 'Yes' ELSE 'No' END              AS double_quota,
+       double_last_date                                               AS double_quota_date,
+       double_quota_gb,
+       allocated_gb                                                   AS total_allocated_gb,
+
+       catalogue_quota_gb,
+       CASE WHEN catalogue_quota_gb > 0
+            THEN TRUNC(main_quota_gb / catalogue_quota_gb) END        AS main_quota_renewals,
+
+       edr_sessions,
+       cons_e                                                         AS total_consumed_gb,
+       ROUND(cons_e / NULLIF(allocated_gb,0) * 100, 2)                AS consumption_pct,
+       allocated_gb - cons_e                                          AS variance_gb,
+       ROUND((allocated_gb - cons_e) / NULLIF(allocated_gb,0) * 100, 2) AS variance_pct,
+
+       CASE WHEN main_quota_gb IS NULL  THEN 'No PCRF data'
+            WHEN cons_e >= allocated_gb THEN 'Finisher'
+            ELSE 'Non-Finisher' END                                   AS finisher_status,
+       CASE WHEN main_quota_gb IS NULL OR allocated_gb = 0
+              OR cons_e >= allocated_gb THEN NULL
+            WHEN cons_e / allocated_gb < 0.25 THEN 'CAT1'
+            WHEN cons_e / allocated_gb < 0.50 THEN 'CAT2'
+            WHEN cons_e / allocated_gb < 0.75 THEN 'CAT3'
+            ELSE                                   'CAT4'
+       END                                                            AS consumption_category
+FROM   calc
+ORDER  BY BILLCYCLE, MSISDN;
 
 
 
--- =====================================================================
--- QUERY 2 : SUMMARY  (one row: base vs TE invoice, difference, %)
--- =====================================================================
-WITH
-pcrf_base AS (
-    SELECT /*+ MATERIALIZE PARALLEL(p 64) FULL(p) */ DISTINCT p.MSISDN
-    FROM RP7VFEPIDAT.PFM_PCRF_FILTERED p
-    WHERE p.RUN_DATE >= TO_DATE('20260901','YYYYMMDD')
-      AND p.RUN_DATE <  TO_DATE('20261001','YYYYMMDD')
-      AND p.SERVICE_NAME IS NOT NULL
-      AND p.PACKAGE_TYPE = 'Main Bundle'
-      AND p.SERVICE_NAME NOT IN ('Serv_DSL_Generic_Promo',
-                                 'Serv_DSL_Compensation_Gift',
-                                 'Serv_DSL_Throttling',
-                                 'ADSL_OnHold',
-                                 'Serv_DSL_Double_Quota_Pre')
-      AND p.SERVICE_NAME NOT LIKE '%Add%'
-      AND p.SERVICE_NAME NOT LIKE '%DoubleQuota%'
-),
 
-sdsl_cloud AS (
-    SELECT /*+ MATERIALIZE PARALLEL(b 64) */ DISTINCT b.MSISDN
-    FROM RP7VFEPIDAT.PFM_BSCS_ADSL b
-    WHERE b.RUN_DATE = 20261001
-      AND (b.TMCODE_DES LIKE 'SDSL%' OR b.TMCODE_DES LIKE 'Cloud%')
-),
 
-te_invoice AS (
-    SELECT /*+ MATERIALIZE PARALLEL(t 64) FULL(t) */ DISTINCT t.MSISDN
-    FROM RP7VFEPIDAT.RD_T_TE_DATA_BASE_HISTORICAL t
-    WHERE t.RUN_DATE >= TO_DATE('20260901','YYYYMMDD')
-      AND t.RUN_DATE <  TO_DATE('20261001','YYYYMMDD')
-),
+this is the final finisher query i use
+i want to d osome stuff let us do it then write me the query bur ask me first i you have questions.
 
-base AS (
-    SELECT /*+ PARALLEL(64) */ pb.MSISDN
-    FROM pcrf_base pb
-    WHERE NOT EXISTS (SELECT /*+ HASH_AJ */ 1 FROM sdsl_cloud s WHERE s.MSISDN = pb.MSISDN)
-)
+i want to ask first is i get all the postpaid msisdn from the billing? yes or no? can we add afilter to search only fot 
+the bill period?
+i do understand the prepaid appearing becasue he was postpaid from billing 
+then he converted to prepain in the next days.  tell me how can i hanel it
+as i want to ignore the msisdn if there is prepain type dont take the last postpaid do u understand?
+20504693827|ACTIVE|POST|  305314607|   1334|20260909|02       |High Speed 30MB 150GB Postpaid|Serv_ADSL_HS_30M_140G     |                   1|INDIVIDUALS|
+20504693827|ACTIVE|POST|  305314607|   1334|20260910|02       |High Speed 30MB 150GB Postpaid|Serv_ADSL_HS_30M_140G     |                   1|INDIVIDUALS|
+20504693827|ACTIVE|PRE |  306682346|   1352|20260911|03       |ADSL Prepaid Unified Tariff   |_N                        |                   1|           |
+20504693827|ACTIVE|PRE |  306682346|   1352|20260912|03       |ADSL Prepaid Unified Tariff   |_N                        |                   1|PRE PAY    |
+20504693827|ACTIVE|PRE |  306682346|   1352|20260913|03       |ADSL Prepaid Unified Tariff   |_N                        |                   1|PRE PAY    |
 
-SELECT /*+ PARALLEL(64) USE_HASH(te) */
-    TO_DATE('20261001','YYYYMMDD')                                      AS RUN_DATE,
-    COUNT(*)                                                            AS TOTAL_PCRF_BASE,
-    COUNT(te.MSISDN)                                                    AS ON_TE_INVOICE,
-    COUNT(*) - COUNT(te.MSISDN)                                         AS NOT_ON_TE_INVOICE,
-    ROUND((COUNT(*) - COUNT(te.MSISDN)) * 100 / NULLIF(COUNT(*), 0), 2) AS NOT_ON_TE_PCT
-FROM base b
-LEFT JOIN te_invoice te ON te.MSISDN = b.MSISDN;
+also im searching in all billing table. then the validation in m mind is to after getting this msisdn 
+do a second layer of validation to search on bscs table again in each msisdn period if there any record the type is pre 
+just ignore the whole msisdn  
+got me?
+
+i want to add in bscs not like '%CP%'   in the bscs filteration  remove thoses 
+20CP000115054	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000126006	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000126010	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000132028	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000136065	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000136068	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000137095	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000140010	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000140019	7	2026-10	No	0		No	0	0		0		No PCRF data	
+20CP000140030	7	2026-10	No	0		No	0	0		0		No PCRF data	
+
+
+--------------------------
+
+
+i want to exclude _GC_  from catalouge services as well to excldue from allocated and from 
+EDRs as well  put both condition to exclude servie contain _GC_
+
+and in the end if the allocated GB=0 and consumption=0   just no allocated found
+if consumption =0 say no consumption found
+
+if both dont found say both doesnt found. do u get what i mean? 
+
+
+
+
+
+
+
+
+
+
