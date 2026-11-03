@@ -1,68 +1,300 @@
-SP2-0734: unknown command beginning "cycles AS ..." - rest of line ignored.
-SP2-0734: unknown command beginning "cycle_sel ..." - rest of line ignored.
-SP2-0734: unknown command beginning "cycle_cand..." - rest of line ignored.
-SP2-0734: unknown command beginning "cycle_win ..." - rest of line ignored.
-SP2-0734: unknown command beginning "bounds AS ..." - rest of line ignored.
-SP2-0734: unknown command beginning "bscs_post ..." - rest of line ignored.
-SP2-0734: unknown command beginning "billing AS..." - rest of line ignored.
-SP2-0734: unknown command beginning "bscs_pre A..." - rest of line ignored.
-SP2-0734: unknown command beginning "billing_ok..." - rest of line ignored.
-SP2-0734: unknown command beginning "catalogue ..." - rest of line ignored.
-SP2-0042: unknown command "subs AS (" - rest of line ignored.
-SP2-0734: unknown command beginning "win_rows A..." - rest of line ignored.
-SP2-0734: unknown command beginning "AND         ( LO..." - rest of line ignored.
-SP2-0734: unknown command beginning "OR UPPER(T..." - rest of line ignored.
-SP2-0042: unknown command ")," - rest of line ignored.
-SP2-0734: unknown command beginning "svc_last A..." - rest of line ignored.
-SP2-0734: unknown command beginning "quota_agg ..." - rest of line ignored.
-SP2-0734: unknown command beginning "edr_agg AS..." - rest of line ignored.
-SP2-0042: unknown command "calc AS (" - rest of line ignored.
-SP2-0734: unknown command beginning "CASE WHEN ..." - rest of line ignored.
-SP2-0734: unknown command beginning "main_svc_c..." - rest of line ignored.
-SP2-0734: unknown command beginning "main_servi..." - rest of line ignored.
-SP2-0734: unknown command beginning "main_last_..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "main_quota..." - rest of line ignored.
-SP2-0734: unknown command beginning "CASE WHEN ..." - rest of line ignored.
-SP2-0734: unknown command beginning "double_las..." - rest of line ignored.
-SP2-0734: unknown command beginning "double_quo..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "allocated_..." - rest of line ignored.
-SP2-0734: unknown command beginning "catalogue_..." - rest of line ignored.
-SP2-0734: unknown command beginning "CASE WHEN ..." - rest of line ignored.
-SP2-0734: unknown command beginning "THEN TRUNC..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "edr_sessio..." - rest of line ignored.
-SP2-0734: unknown command beginning "cons_e    ..." - rest of line ignored.
-SP2-0734: unknown command beginning "ROUND(cons..." - rest of line ignored.
-SP2-0734: unknown command beginning "allocated_..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "ROUND((all..." - rest of line ignored.
-SP2-0734: unknown command beginning "CASE WHEN ..." - rest of line ignored.
-SP2-0734: unknown command beginning "WHEN alloc..." - rest of line ignored.
-SP2-0734: unknown command beginning "WHEN cons_..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "WHEN cons_..." - rest of line ignored.
-SP2-0734: unknown command beginning "ELSE 'Non-..." - rest of line ignored.
-SP2-0734: unknown command beginning "CASE WHEN ..." - rest of line ignored.
-SP2-0734: unknown command beginning "OR cons_e ..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "WHEN cons_..." - rest of line ignored.
-SP2-0734: unknown command beginning "WHEN cons_..." - rest of line ignored.
-SP2-0734: unknown command beginning "WHEN cons_..." - rest of line ignored.
-SP2-0734: unknown command beginning "ELSE      ..." - rest of line ignored.
-SP2-0044: For a list of known commands enter HELP
-and to leave enter EXIT.
-SP2-0734: unknown command beginning "END             ..." - rest of line ignored.
-SP2-0734: unknown command beginning "FROM   cal..." - rest of line ignored.
+-- sqlplus RP7VFEPIDAT/RP7VFEPIDAT@RAIDDB @insert_finisher_kpi.sql
+SET ECHO OFF FEEDBACK ON TIMING ON
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
 
-Commit complete.
+INSERT /*+ APPEND */ INTO RP7VFEPIDAT.PFM_ADSL_FINISHER_KPI (
+    MSISDN, BILLCYCLE, CYCLE_START, CYCLE_END, CYCLE_MONTH, CYCLE_MONTH_NAME,
+    SERVICE_CHANGED, MAIN_SERVICES_COUNT, MAIN_SERVICES,
+    MAIN_QUOTA_DATE, MAIN_QUOTA_GB, DOUBLE_QUOTA, DOUBLE_QUOTA_DATE, DOUBLE_QUOTA_GB,
+    TOTAL_ALLOCATED_GB, CATALOGUE_QUOTA_GB, MAIN_QUOTA_RENEWALS,
+    EDR_SESSIONS, TOTAL_CONSUMED_GB, CONSUMPTION_PCT, VARIANCE_GB, VARIANCE_PCT,
+    FINISHER_STATUS, CONSUMPTION_CATEGORY
+)
+WITH params AS (
+    SELECT /*+ PARALLEL(f 32) */ TRUNC(MAX(f.RUN_DATE)) AS ref_date
+    FROM   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
+),
 
-Elapsed: 00:00:00.00
-Disconnected from Oracle Database 19c Enterprise Edition Release 19.
+cycles AS (
+    -- bc = bill cycle, e = END day of cycle (31 = last day of month -> LAST_DAY handles 28/29/30/31)
+    SELECT '01' AS bc, 31 AS e FROM dual UNION ALL
+    SELECT '02',       15      FROM dual UNION ALL   -- 16 -> 15
+    SELECT '04',        3      FROM dual UNION ALL   -- 4  -> 3
+    SELECT '07',        6      FROM dual UNION ALL   -- 7  -> 6
+    SELECT '09',       20      FROM dual UNION ALL   -- 21 -> 20 (to be confirmed)
+    SELECT '11',       10      FROM dual UNION ALL   -- 11 -> 10
+    SELECT '25',       24      FROM dual             -- 25 -> 24
+),
+
+-- >>> CHOOSE THE BILL CYCLES TO RUN HERE <<<
+cycle_sel AS (
+    SELECT bc, e
+    FROM   cycles
+    WHERE  bc IN ('01','02','04','07','09','11','25')            -- e.g. ('01') or ('01','07','25')
+),
+
+cycle_cand AS (
+    SELECT c.bc, c.e, p.ref_date,
+           CASE WHEN c.e = 31
+                THEN LAST_DAY(TRUNC(p.ref_date,'MM'))
+                ELSE TRUNC(p.ref_date,'MM') + c.e - 1 END                 AS end_this_month,
+           CASE WHEN c.e = 31
+                THEN LAST_DAY(ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1))
+                ELSE ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1) + c.e - 1 END  AS end_prev_month
+    FROM   cycle_sel c CROSS JOIN params p
+),
+
+cycle_win AS (
+    SELECT bc, cycle_start, cycle_end,
+           -- BSCS RUN_DATE is a number (YYYYMMDD), so keep the window as numbers too
+           TO_NUMBER(TO_CHAR(cycle_start,'YYYYMMDD')) AS cs_num,
+           TO_NUMBER(TO_CHAR(cycle_end,  'YYYYMMDD')) AS ce_num
+    FROM (
+        SELECT bc, cycle_end,
+               CASE WHEN e = 31 THEN TRUNC(cycle_end,'MM')
+                    ELSE ADD_MONTHS(cycle_end,-1) + 1 END AS cycle_start
+        FROM (
+            SELECT bc, e,
+                   CASE WHEN end_this_month <= ref_date
+                        THEN end_this_month ELSE end_prev_month END AS cycle_end
+            FROM cycle_cand
+        )
+    )
+),
+
+bounds AS (
+    SELECT MIN(cycle_start) AS min_start, MAX(cycle_end) AS max_end,
+           MIN(cs_num)      AS min_num,   MAX(ce_num)    AS max_num
+    FROM   cycle_win
+),
+
+-- ---------------------------------------------------------------------
+-- BILLING - LAYER 1: postpaid rows inside the bill period of their own
+-- bill cycle only (BC01 rows -> BC01 window, BC02 rows -> BC02 window ...)
+-- ---------------------------------------------------------------------
+bscs_post AS (
+    SELECT /*+ MATERIALIZE PARALLEL(b 32) USE_HASH(w) */
+           b.MSISDN, b.RUN_DATE, b.BILLCYCLE, b.PCRF_SERVICE_NAME_EXPECTED,
+           b.STATUS, b.PRICE_GROUP, b.TMCODE_DES,
+           w.cycle_start, w.cycle_end, w.cs_num, w.ce_num
+    FROM   RP7VFEPIDAT.PFM_BSCS_ADSL b
+    JOIN   cycle_win w
+           ON  w.bc        = b.BILLCYCLE
+           AND b.RUN_DATE >= w.cs_num
+           AND b.RUN_DATE <= w.ce_num
+    WHERE  b.RUN_DATE >= (SELECT min_num FROM bounds)
+    AND    b.RUN_DATE <= (SELECT max_num FROM bounds)
+    AND    b.TYPE = 'POST'
+    AND    b.MSISDN NOT LIKE '%CP%'                              -- exclude CP numbers
+),
+
+-- one row per MSISDN = its last postpaid row in the period,
+-- kept only if it was ACTIVE on ANY day of the period
+billing AS (
+    SELECT MSISDN, BILLCYCLE, PCRF_SERVICE_NAME_EXPECTED,
+           cycle_start, cycle_end, cs_num, ce_num
+    FROM (
+        SELECT x.*,
+               ROW_NUMBER() OVER (PARTITION BY x.MSISDN ORDER BY x.RUN_DATE DESC) AS rn,
+               MAX(CASE WHEN x.STATUS = 'ACTIVE' THEN 1 ELSE 0 END)
+                   OVER (PARTITION BY x.MSISDN)                               AS was_active
+        FROM   bscs_post x
+    )
+    WHERE rn = 1
+    AND   was_active = 1
+    AND   NVL(PRICE_GROUP,'x') NOT IN ('TEST PHONES','Pre-paid Test SIM',
+                                       'Test Individuals','Dummy PG')
+    AND   UPPER(NVL(TMCODE_DES,'x')) NOT LIKE '%SDSL%'      -- exclude SDSL
+),
+
+-- ---------------------------------------------------------------------
+-- BILLING - LAYER 2: every prepaid row in the same date range.
+-- If the MSISDN is PRE on any day of ITS period -> drop the whole MSISDN.
+-- (PRE after the period end is ignored.)
+-- ---------------------------------------------------------------------
+bscs_pre AS (
+    SELECT /*+ MATERIALIZE PARALLEL(b 32) */ DISTINCT b.MSISDN, b.RUN_DATE
+    FROM   RP7VFEPIDAT.PFM_BSCS_ADSL b
+    WHERE  b.RUN_DATE >= (SELECT min_num FROM bounds)
+    AND    b.RUN_DATE <= (SELECT max_num FROM bounds)
+    AND    b.TYPE = 'PRE'
+),
+
+billing_ok AS (
+    SELECT b.*
+    FROM   billing b
+    WHERE  NOT EXISTS (
+               SELECT /*+ HASH_AJ */ 1
+               FROM   bscs_pre p
+               WHERE  p.MSISDN    = b.MSISDN
+               AND    p.RUN_DATE >= b.cs_num
+               AND    p.RUN_DATE <= b.ce_num
+           )
+),
+
+-- postpaid Main Bundles only: used for catalogue quota AND as the list of valid PCRF services
+-- services containing _GC_ are removed here (INSTR searches the text literally)
+catalogue AS (
+    SELECT /*+ MATERIALIZE */
+           UPPER(TRIM(PCRF_SERVICE_NAME)) AS svc_key,
+           MAX(PCRF_QOUTA_VALUE_GB)       AS catalogue_quota_gb
+    FROM   RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE
+    WHERE  PROD_TYPE_NAME = 'Main Bundle'
+    AND    INSTR(UPPER(PCRF_SERVICE_NAME), '_GC_') = 0
+   -- AND    UPPER(PCRF_TYPE) = 'POSTPAID'
+    GROUP  BY UPPER(TRIM(PCRF_SERVICE_NAME))
+),
+
+subs AS (
+    SELECT /*+ MATERIALIZE */
+           b.MSISDN,
+           SUBSTR(b.MSISDN, 2) AS edr_msisdn,
+           b.BILLCYCLE,
+           b.cycle_start, b.cycle_end,
+           c.catalogue_quota_gb
+    FROM   billing_ok b
+    LEFT JOIN catalogue c ON c.svc_key = UPPER(TRIM(b.PCRF_SERVICE_NAME_EXPECTED))
+),
+
+win_rows AS (
+    SELECT /*+ PARALLEL(f 32) USE_HASH(f) */
+           s.MSISDN,
+           f.SERVICE_NAME,
+           f.RUN_DATE,
+           f.QUOTA_SUM,
+           CASE WHEN LOWER(f.SERVICE_NAME) LIKE '%double%quota%' THEN 1 ELSE 0 END AS is_double
+    FROM   subs s
+    JOIN   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
+           ON  f.MSISDN   = s.MSISDN
+           AND f.RUN_DATE >= s.cycle_start
+           AND f.RUN_DATE <  s.cycle_end + 1
+    WHERE  f.RUN_DATE >= (SELECT min_start   FROM bounds)
+    AND    f.RUN_DATE <  (SELECT max_end + 1 FROM bounds)
+    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%addon%'
+    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%throttling%'
+    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%promo%'
+    AND    INSTR(UPPER(f.SERVICE_NAME), '_GC_') = 0   -- also covers double quota
+
+    -- validation: keep only services found in the postpaid Main Bundle catalogue
+    -- (double quota is kept by name, since it is not a Main Bundle)
+    AND   ( LOWER(f.SERVICE_NAME) LIKE '%double%quota%'
+            OR UPPER(TRIM(f.SERVICE_NAME)) IN (SELECT svc_key FROM catalogue) )
+),
+
+-- last quota value of each service in the cycle (not rounded yet)
+svc_last AS (
+    SELECT MSISDN, SERVICE_NAME, is_double,
+           MIN(RUN_DATE) AS first_dt,
+           MAX(RUN_DATE) AS last_dt,
+           MAX(QUOTA_SUM) KEEP (DENSE_RANK LAST ORDER BY RUN_DATE) / 1048576 AS svc_quota_gb
+    FROM   win_rows
+    GROUP  BY MSISDN, SERVICE_NAME, is_double
+),
+
+-- sum first, then round to whole GB
+quota_agg AS (
+    SELECT MSISDN,
+           ROUND(SUM(CASE WHEN is_double = 0 THEN svc_quota_gb END))  AS main_quota_gb,
+           COUNT(CASE WHEN is_double = 0 THEN 1 END)                  AS main_svc_cnt,
+           ROUND(SUM(CASE WHEN is_double = 1 THEN svc_quota_gb END))  AS double_quota_gb,
+           COUNT(CASE WHEN is_double = 1 THEN 1 END)                  AS double_svc_cnt,
+           MAX(CASE WHEN is_double = 0 THEN last_dt END)              AS main_last_date,
+           MAX(CASE WHEN is_double = 1 THEN last_dt END)              AS double_last_date,
+           LISTAGG(CASE WHEN is_double = 0 THEN SERVICE_NAME END, ' > ')
+               WITHIN GROUP (ORDER BY first_dt)                       AS main_services
+    FROM   svc_last
+    GROUP  BY MSISDN
+),
+
+edr_agg AS (
+    -- QUOTA_CONSUMPTION is a running total per service:
+    -- take its highest value per service (= final total, records can arrive out of order),
+    -- then sum all services of the MSISDN
+    SELECT MSISDN,
+           ROUND(SUM(svc_cons) / 1048576) AS cons_edr_gb,
+           SUM(svc_sessions)              AS edr_sessions
+    FROM (
+    SELECT /*+ PARALLEL(e 32) USE_HASH(e) */
+           s.MSISDN,
+           e.SERVICE_NAME,
+           MAX(e.QUOTA_CONSUMPTION)            AS svc_cons,
+           COUNT(*)                            AS svc_sessions
+    FROM   subs s
+    JOIN   RP7VFEPIDAT.PFM_PCRF_EDRS_STG_CONSUM e
+           ON  e.MSISDN = s.edr_msisdn
+           AND e.TIME  >= s.cycle_start
+           AND e.TIME   < s.cycle_end + 1
+    WHERE  e.TIME >= (SELECT min_start   FROM bounds)
+    AND    e.TIME <  (SELECT max_end + 1 FROM bounds)
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%addon%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%throttling%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%promo%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%adn%'
+    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%gift%'
+    AND    INSTR(UPPER(e.SERVICE_NAME), '_GC_') = 0
+    GROUP  BY s.MSISDN, e.SERVICE_NAME
+    )
+    GROUP  BY MSISDN
+),
+
+calc AS (
+    SELECT s.MSISDN, s.BILLCYCLE, s.cycle_start, s.cycle_end,
+           s.catalogue_quota_gb,
+           q.main_last_date, q.double_last_date,
+           q.main_services,
+           NVL(q.main_svc_cnt,0)                                 AS main_svc_cnt,
+           q.main_quota_gb,
+           NVL(q.double_quota_gb,0)                              AS double_quota_gb,
+           CASE WHEN NVL(q.double_svc_cnt,0) > 0 THEN 1 ELSE 0 END AS has_double,
+           NVL(q.main_quota_gb,0) + NVL(q.double_quota_gb,0)     AS allocated_gb,
+           NVL(e.cons_edr_gb,0)                                  AS cons_e,
+           NVL(e.edr_sessions,0)                                 AS edr_sessions
+    FROM   subs s
+    LEFT JOIN quota_agg q ON q.MSISDN = s.MSISDN    -- keeps customers with no PCRF data
+    LEFT JOIN edr_agg   e ON e.MSISDN = s.MSISDN
+)
+
+SELECT MSISDN,
+       BILLCYCLE,
+       cycle_start,
+       cycle_end,
+       TO_CHAR(cycle_end,'YYYY-MM')                                   AS cycle_month,
+       TO_CHAR(cycle_end,'FMMonth YYYY','NLS_DATE_LANGUAGE=ENGLISH')  AS cycle_month_name,
+
+       CASE WHEN main_svc_cnt > 1 THEN 'Yes' ELSE 'No' END            AS service_changed,
+       main_svc_cnt                                                   AS main_services_count,
+       main_services,
+
+       main_last_date                                                 AS main_quota_date,
+       main_quota_gb,
+       CASE WHEN has_double = 1 THEN 'Yes' ELSE 'No' END              AS double_quota,
+       double_last_date                                               AS double_quota_date,
+       double_quota_gb,
+       allocated_gb                                                   AS total_allocated_gb,
+
+       catalogue_quota_gb,
+       CASE WHEN catalogue_quota_gb > 0
+            THEN TRUNC(main_quota_gb / catalogue_quota_gb) END        AS main_quota_renewals,
+
+       edr_sessions,
+       cons_e                                                         AS total_consumed_gb,
+       ROUND(cons_e / NULLIF(allocated_gb,0) * 100, 2)                AS consumption_pct,
+       allocated_gb - cons_e                                          AS variance_gb,
+       ROUND((allocated_gb - cons_e) / NULLIF(allocated_gb,0) * 100, 2) AS variance_pct,
+
+       CASE WHEN allocated_gb = 0 AND cons_e = 0 THEN 'Both not found'
+            WHEN allocated_gb = 0                THEN 'No allocated found'
+            WHEN cons_e = 0                      THEN 'No consumption found'
+            WHEN cons_e >= allocated_gb          THEN 'Finisher'
+            ELSE 'Non-Finisher' END                                   AS finisher_status,
+       CASE WHEN allocated_gb = 0 OR cons_e = 0
+              OR cons_e >= allocated_gb THEN NULL
+            WHEN cons_e / allocated_gb < 0.25 THEN 'CAT1'
+            WHEN cons_e / allocated_gb < 0.50 THEN 'CAT2'
+            WHEN cons_e / allocated_gb < 0.75 THEN 'CAT3'
+            ELSE                                   'CAT4'
+       END                                                            AS consumption_category
+FROM   calc;
+
+COMMIT;
+EXIT;
