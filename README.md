@@ -1,5 +1,7 @@
 -- sqlplus RP7VFEPIDAT/RP7VFEPIDAT@RAIDDB @insert_finisher_kpi.sql
 SET ECHO OFF FEEDBACK ON TIMING ON
+SET SQLBLANKLINES ON          -- allow empty lines inside the query
+SET DEFINE OFF                -- don't treat & as a variable
 WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
 
 INSERT /*+ APPEND */ INTO RP7VFEPIDAT.PFM_ADSL_FINISHER_KPI (
