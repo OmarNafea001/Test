@@ -12,10 +12,10 @@ from utils.export_to_oracle import prepare_ctl
 from utils.export_to_oracle import run_sqlldr
 
 
-def export_quota_consum_count(run_date: str, con=None):
+def export_postpaid_quota_consumption_cases(run_date: str, con=None):
 
     logger = get_logger(
-        flow="quota_consum_count",
+        flow="postpaid_quota_consumption_cases",
         log_dir=None,
         run_date=run_date
     )
@@ -25,87 +25,56 @@ def export_quota_consum_count(run_date: str, con=None):
             con = duckdb_connection()
 
         logger.info("###########################################################")
-        logger.info(f"###### quota_consum_count for run_date= {run_date} ######")
+        logger.info(f"###### postpaid_quota_consumption_cases for run_date= {run_date} ######")
         logger.info("###########################################################")
 
         start_time = datetime.now()
 
-        pcrf_dump = f"/project/PLATFORM_INTEGRITY/exports/pcrf_{run_date}*"
+        # output CSV of the quota_consumption_cases job
         quota_consumption_cases_dump = f"/project/PLATFORM_INTEGRITY/exports/quota_consumption_cases_{run_date}*"
 
-        # PFM_PCRF_FILTERED
-        con.execute(f"""
-            CREATE OR REPLACE TABLE pcrf_src AS
-            SELECT RUN_DATE, MSISDN
-            FROM read_csv_auto('{pcrf_dump}', all_varchar=true, ignore_errors=True)
-        """)
-
-        # RD_T_PCRF_QUOTA_CONSUM_CASES (output CSV of the quota_consumption_cases job)
         con.execute(f"""
             CREATE OR REPLACE TABLE quota_consumption_cases_src AS
-            SELECT RUN_DATE, MSISDN, PCRF_TYPE
+            SELECT RUN_DATE, MSISDN, SERVICE_NAME, QUOTA_SUM_GB,
+                   EXPECTED_ORG_QUOTA, EXPECTED_TAX_QUOTA, VARIANCE,
+                   PCRF_TYPE, LOOKUP_INCLUSION
             FROM read_csv_auto('{quota_consumption_cases_dump}', all_varchar=true, ignore_errors=True)
         """)
 
         con.execute("""
-            CREATE OR REPLACE TABLE quota_consum_count AS
-            WITH PCRF_Total_Base AS
-            (
-                SELECT TRY_CAST(RUN_DATE AS DATE) AS RUN_DATE,
-                       COUNT(DISTINCT MSISDN)     AS PCRF_TOTAL_BASE
-                FROM pcrf_src
-                GROUP BY 1
-            ),
-            QUOTA_CONSUM AS
-            (
-                SELECT TRY_CAST(RUN_DATE AS DATE) AS RUN_DATE,
-                       CASE
-                           WHEN PCRF_TYPE IN ('PREPAID', 'PREPAID-POSTPAID')
-                               THEN 'PREPAID'
-                           ELSE PCRF_TYPE
-                       END AS PCRF_TYPE_GROUP,
-                       COUNT(DISTINCT MSISDN) AS QUOTA_CONSUM_COUNT
-                FROM quota_consumption_cases_src
-                GROUP BY 1, 2
-            )
-            SELECT
-                B.RUN_DATE,
-                SUM(Q.QUOTA_CONSUM_COUNT)                                              AS QUOTA_CONSUM_COUNT,
-                B.PCRF_TOTAL_BASE,
-                (B.PCRF_TOTAL_BASE - SUM(Q.QUOTA_CONSUM_COUNT))                        AS VARIANCE,
-                ROUND((SUM(Q.QUOTA_CONSUM_COUNT) / NULLIF(B.PCRF_TOTAL_BASE, 0)) * 100, 3) AS PERCENTAGE,
-                Q.PCRF_TYPE_GROUP                                                      AS PCRF_TYPE
-            FROM PCRF_Total_Base B
-            JOIN QUOTA_CONSUM Q
-                ON B.RUN_DATE = Q.RUN_DATE
-            GROUP BY
-                B.RUN_DATE,
-                B.PCRF_TOTAL_BASE,
-                Q.PCRF_TYPE_GROUP
+            CREATE OR REPLACE TABLE postpaid_quota_consumption_cases AS
+            SELECT TRY_CAST(RUN_DATE AS DATE)            AS RUN_DATE,
+                   MSISDN,
+                   SERVICE_NAME,
+                   TRY_CAST(QUOTA_SUM_GB AS DOUBLE)       AS QUOTA_SUM_GB,
+                   TRY_CAST(EXPECTED_ORG_QUOTA AS DOUBLE) AS EXPECTED_ORG_QUOTA,
+                   TRY_CAST(EXPECTED_TAX_QUOTA AS DOUBLE) AS EXPECTED_TAX_QUOTA,
+                   TRY_CAST(VARIANCE AS DOUBLE)           AS VARIANCE,
+                   PCRF_TYPE,
+                   LOOKUP_INCLUSION
+            FROM quota_consumption_cases_src
+            WHERE PCRF_TYPE = 'POSTPAID'
         """)
 
-        count = con.execute("SELECT COUNT(*) FROM quota_consum_count").fetchone()[0]
+        count = con.execute("SELECT COUNT(*) FROM postpaid_quota_consumption_cases").fetchone()[0]
         logger.info(f"Total processed rows: {count}")
 
         if count == 0:
-            raise ValueError(f"quota_consum_count produced 0 rows for RUN_DATE= {run_date}; check source files and filters")
+            raise ValueError(f"postpaid_quota_consumption_cases produced 0 rows for RUN_DATE= {run_date}; check source files and filters")
 
-        logger.info(f"Exporting quota_consum_count_{run_date}.csv ..")
-        con.execute(f"""
-            COPY (SELECT * FROM quota_consum_count ORDER BY PCRF_TYPE)
-            TO '/project/PLATFORM_INTEGRITY/exports/quota_consum_count_{run_date}.csv' (HEADER, DELIMITER ',')
-        """)
+        logger.info(f"Exporting postpaid_quota_consumption_cases_{run_date}.csv ..")
+        con.execute(f"""COPY postpaid_quota_consumption_cases TO '/project/PLATFORM_INTEGRITY/exports/postpaid_quota_consumption_cases_{run_date}.csv' (HEADER, DELIMITER ',')""")
 
-        logger.info("Inserting into RP7VFEPIDAT.QUOTA_CONSUM_COUNT table ..")
-        ctl_file = prepare_ctl("quota_consum_count", run_date)
-        run_sqlldr("quota_consum_count", run_date, ctl_file=ctl_file)
+        logger.info("Inserting into RP7VFEPIDAT.POSTPAID_QUOTA_CONSUMPTION_CASES table ..")
+        ctl_file = prepare_ctl("postpaid_quota_consumption_cases", run_date)
+        run_sqlldr("postpaid_quota_consumption_cases", run_date, ctl_file=ctl_file)
         logger.info("Insertion done")
 
         end_time = datetime.now()
-        logger.info("quota_consum_count job finished")
-        logger.info(f"quota_consum_count total duration: {end_time - start_time}")
+        logger.info("postpaid_quota_consumption_cases job finished")
+        logger.info(f"postpaid_quota_consumption_cases total duration: {end_time - start_time}")
     except Exception as e:
-        logger.exception(f"quota_consum_count failed for run_date= {run_date} | error= {str(e)}")
+        logger.exception(f"postpaid_quota_consumption_cases failed for run_date= {run_date} | error= {str(e)}")
         raise
 
 
@@ -113,4 +82,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_date", required=True)
     args = parser.parse_args()
-    export_quota_consum_count(run_date=args.run_date)
+    export_postpaid_quota_consumption_cases(run_date=args.run_date)
