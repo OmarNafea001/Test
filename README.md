@@ -152,6 +152,59 @@ def export_quota_consum_count(run_date: str, con=None):
         raise
 
 
+
+
+
+
+
+
+
+
+
+
+
+        WITH PCRF_Total_Base AS
+(
+    SELECT run_date, COUNT(DISTINCT MSISDN) AS PCRF_Total_Base
+    FROM RP7VFEPIDAT.PFM_PCRF_FILTERED
+    WHERE run_date = TO_DATE($1, 'YYYYMMDD')
+    GROUP BY run_date
+),
+QUOTA_CONSUM AS
+(
+    SELECT RUN_DATE,
+           CASE
+               WHEN PCRF_TYPE IN ('PREPAID', 'PREPAID-POSTPAID')
+                   THEN 'PREPAID'
+               ELSE PCRF_TYPE
+           END AS PCRF_TYPE_GROUP,
+           COUNT(DISTINCT MSISDN) AS QUOTA_CONSUM_COUNT
+    FROM RP7VFEPIDAT.RD_T_PCRF_QUOTA_CONSUM_CASES
+    WHERE run_date = TO_DATE($1, 'YYYYMMDD')
+    GROUP BY RUN_DATE,
+             CASE
+                 WHEN PCRF_TYPE IN ('PREPAID', 'PREPAID-POSTPAID')
+                     THEN 'PREPAID'
+                 ELSE PCRF_TYPE
+             END
+)
+SELECT
+    B.RUN_DATE,
+    SUM(Q.QUOTA_CONSUM_COUNT) AS QUOTA_CONSUM_COUNT,
+    B.PCRF_TOTAL_BASE,
+    (B.PCRF_TOTAL_BASE - SUM(Q.QUOTA_CONSUM_COUNT)) AS VARIANCE,
+    ROUND((SUM(Q.QUOTA_CONSUM_COUNT) / B.PCRF_TOTAL_BASE) * 100, 3) AS PERCENTAGE,
+    Q.PCRF_TYPE_GROUP AS PCRF_TYPE
+FROM PCRF_Total_Base B
+JOIN QUOTA_CONSUM Q
+    ON B.RUN_DATE = Q.RUN_DATE
+GROUP BY
+    B.RUN_DATE,
+    B.PCRF_TOTAL_BASE,
+    Q.PCRF_TYPE_GROUP
+ORDER BY Q.PCRF_TYPE_GROUP;
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_date", required=True)
