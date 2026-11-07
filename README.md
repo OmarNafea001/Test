@@ -1,5 +1,3 @@
-python csv_to_parquet.py my_lookup.csv /project/PLATFORM_INTEGRITY/lookups/LK_MY_LOOKUP.parquet
-
 import os
 import sys
 
@@ -14,10 +12,10 @@ from utils.export_to_oracle import prepare_ctl
 from utils.export_to_oracle import run_sqlldr
 
 
-def export_quota_consumption_cases(run_date: str, con=None):
+def export_quota_consum_count(run_date: str, con=None):
 
     logger = get_logger(
-        flow="quota_consumption_cases",
+        flow="quota_consum_count",
         log_dir=None,
         run_date=run_date
     )
@@ -27,16 +25,14 @@ def export_quota_consumption_cases(run_date: str, con=None):
             con = duckdb_connection()
 
         logger.info("###########################################################")
-        logger.info(f"###### quota_consumption_cases for run_date= {run_date} ######")
+        logger.info(f"###### quota_consum_count for run_date= {run_date} ######")
         logger.info("###########################################################")
 
         start_time = datetime.now()
 
-        prev_date = (datetime.strptime(run_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
-        logger.info(f"Counting subscribers for RUN_DATE= {prev_date}")
 
-        pcrf_dump = f"/RAIDdata/PI/PI_PRJ/exports/pcrf_{run_date}*"
-        pcrf_consumption_dump = f"/RAIDdata/PI/PI_PRJ/exports/pcrf_consum_{run_date}*"
+        pcrf_dump = f"/project/PLATFORM_INTEGRITY/exports/pcrf_{run_date}*"
+        quota_consumption_cases_dump = f"/project/PLATFORM_INTEGRITY/exports/quota_consumption_cases_{run_date}*"
 
         con.execute(f"""
             CREATE OR REPLACE TABLE pcrf_src AS
@@ -47,7 +43,7 @@ def export_quota_consumption_cases(run_date: str, con=None):
         con.execute(f"""
             CREATE OR REPLACE TABLE pcrf_consumption_src AS
             SELECT RUN_DATE,MSISDN, SERVICE_NAME , EXPECTED_ORG_QUOTA,EXPECTED_TAX_QUOTA ,QUOTA_SUM
-            FROM read_csv_auto('{pcrf_consumption_dump}', all_varchar=true, ignore_errors=True)
+            FROM read_csv_auto('{quota_consumption_cases_dump}', all_varchar=true, ignore_errors=True)
         """)
 
         con.execute(f"""
@@ -112,7 +108,7 @@ def export_quota_consumption_cases(run_date: str, con=None):
                     SELECT pcrf_service_name,
                            pcrf_type,
                            prod_type_name
-                    FROM RD_T_DSL_PRODUCT_CATALOGUE
+                    FROM catalouge_test
                 ) catalogue
                     ON consum.service_name = catalogue.pcrf_service_name
 
@@ -143,9 +139,9 @@ def export_quota_consumption_cases(run_date: str, con=None):
         logger.info(f"Exporting quota_consumption_cases_{run_date}.csv ..")
         con.execute(f"""COPY quota_consumption_cases TO '/project/PLATFORM_INTEGRITY/exports/quota_consumption_cases_{run_date}.csv' (HEADER, DELIMITER ',')""")
 
-        logger.info("Inserting into RP7VFEPIDAT.ADSL_SUBS table ..")
-        ctl_file = prepare_ctl("adsl_subs", run_date)
-        run_sqlldr("adsl_subs", run_date, ctl_file=ctl_file)
+        logger.info("Inserting into RP7VFEPIDAT.QUOTA_CONSUM_CASES table ..")
+        ctl_file = prepare_ctl("quota_consumption_cases", run_date)
+        run_sqlldr("quota_consumption_cases", run_date, ctl_file=ctl_file)
         logger.info("Insertion done")
 
         end_time = datetime.now()
