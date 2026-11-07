@@ -1,302 +1,472 @@
--- sqlplus RP7VFEPIDAT/RP7VFEPIDAT@RAIDDB @insert_finisher_kpi.sql
-SET ECHO OFF FEEDBACK ON TIMING ON
-SET SQLBLANKLINES ON
-SET DEFINE OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+import os
+import sys
 
-INSERT /*+ APPEND */ INTO RP7VFEPIDAT.PFM_ADSL_FINISHER_KPI (
-    MSISDN, BILLCYCLE, CYCLE_START, CYCLE_END, CYCLE_MONTH, CYCLE_MONTH_NAME,
-    SERVICE_CHANGED, MAIN_SERVICES_COUNT, MAIN_SERVICES,
-    MAIN_QUOTA_DATE, MAIN_QUOTA_GB, DOUBLE_QUOTA, DOUBLE_QUOTA_DATE, DOUBLE_QUOTA_GB,
-    TOTAL_ALLOCATED_GB, CATALOGUE_QUOTA_GB, MAIN_QUOTA_RENEWALS,
-    EDR_SESSIONS, TOTAL_CONSUMED_GB, CONSUMPTION_PCT, VARIANCE_GB, VARIANCE_PCT,
-    FINISHER_STATUS, CONSUMPTION_CATEGORY
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
 )
-WITH params AS (
-    SELECT /*+ PARALLEL(f 32) */ TRUNC(MAX(f.RUN_DATE)) AS ref_date
-    FROM   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
-),
+sys.path.insert(0, PROJECT_ROOT)
 
-cycles AS (
-    -- bc = bill cycle, e = END day of cycle (31 = last day of month -> LAST_DAY handles 28/29/30/31)
-    SELECT '01' AS bc, 31 AS e FROM dual UNION ALL
-    SELECT '02',       15      FROM dual UNION ALL   -- 16 -> 15
-    SELECT '04',        3      FROM dual UNION ALL   -- 4  -> 3
-    SELECT '07',        6      FROM dual UNION ALL   -- 7  -> 6
-    SELECT '09',       20      FROM dual UNION ALL   -- 21 -> 20 (to be confirmed)
-    SELECT '11',       10      FROM dual UNION ALL   -- 11 -> 10
-    SELECT '25',       24      FROM dual             -- 25 -> 24
-),
+import duckdb
+import argparse
+from datetime import datetime
+from config.duckdb_connection import duckdb_connection
+from utils.logger import get_logger
+from utils.export_to_oracle import prepare_ctl
+from utils.export_to_oracle import run_sqlldr
 
--- >>> CHOOSE THE BILL CYCLES TO RUN HERE <<<
-cycle_sel AS (
-    SELECT bc, e
-    FROM   cycles
-    WHERE  bc IN ('01','02','04','07','09','11','25')            -- e.g. ('01') or ('01','07','25')
-),
 
-cycle_cand AS (
-    SELECT c.bc, c.e, p.ref_date,
-           CASE WHEN c.e = 31
-                THEN LAST_DAY(TRUNC(p.ref_date,'MM'))
-                ELSE TRUNC(p.ref_date,'MM') + c.e - 1 END                 AS end_this_month,
-           CASE WHEN c.e = 31
-                THEN LAST_DAY(ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1))
-                ELSE ADD_MONTHS(TRUNC(p.ref_date,'MM'),-1) + c.e - 1 END  AS end_prev_month
-    FROM   cycle_sel c CROSS JOIN params p
-),
 
-cycle_win AS (
-    SELECT bc, cycle_start, cycle_end,
-           -- BSCS RUN_DATE is a number (YYYYMMDD), so keep the window as numbers too
-           TO_NUMBER(TO_CHAR(cycle_start,'YYYYMMDD')) AS cs_num,
-           TO_NUMBER(TO_CHAR(cycle_end,  'YYYYMMDD')) AS ce_num
-    FROM (
-        SELECT bc, cycle_end,
-               CASE WHEN e = 31 THEN TRUNC(cycle_end,'MM')
-                    ELSE ADD_MONTHS(cycle_end,-1) + 1 END AS cycle_start
-        FROM (
-            SELECT bc, e,
-                   CASE WHEN end_this_month <= ref_date
-                        THEN end_this_month ELSE end_prev_month END AS cycle_end
-            FROM cycle_cand
-        )
+def export_free_traffic(run_date: str, con=None):
+
+    logger = get_logger(
+        flow="free_traffic_mismatch",
+        log_dir=None,
+        run_date=run_date
     )
-),
 
-bounds AS (
-    SELECT MIN(cycle_start) AS min_start, MAX(cycle_end) AS max_end,
-           MIN(cs_num)      AS min_num,   MAX(ce_num)    AS max_num
-    FROM   cycle_win
-),
+    try:
+        if con is None:
+            con = duckdb_connection()
 
--- ---------------------------------------------------------------------
--- BILLING - LAYER 1: postpaid rows inside the bill period of their own
--- bill cycle only (BC01 rows -> BC01 window, BC02 rows -> BC02 window ...)
--- ---------------------------------------------------------------------
-bscs_post AS (
-    SELECT /*+ MATERIALIZE PARALLEL(b 32) USE_HASH(w) */
-           b.MSISDN, b.RUN_DATE, b.BILLCYCLE, b.PCRF_SERVICE_NAME_EXPECTED,
-           b.STATUS, b.PRICE_GROUP, b.TMCODE_DES,
-           w.cycle_start, w.cycle_end, w.cs_num, w.ce_num
-    FROM   RP7VFEPIDAT.PFM_BSCS_ADSL b
-    JOIN   cycle_win w
-           ON  w.bc        = b.BILLCYCLE
-           AND b.RUN_DATE >= w.cs_num
-           AND b.RUN_DATE <= w.ce_num
-    WHERE  b.RUN_DATE >= (SELECT min_num FROM bounds)
-    AND    b.RUN_DATE <= (SELECT max_num FROM bounds)
-    AND    b.TYPE = 'POST'
-    AND    b.MSISDN NOT LIKE '%CP%'                              -- exclude CP numbers
-),
+        logger.info("###########################################################")
+        logger.info(f"###### FREE TRAFFIC MISMATCH for run_date= {run_date} ######")
+        logger.info("###########################################################")
 
--- one row per MSISDN = its last postpaid row in the period,
--- kept only if it was ACTIVE on ANY day of the period
-billing AS (
-    SELECT MSISDN, BILLCYCLE, PCRF_SERVICE_NAME_EXPECTED,
-           cycle_start, cycle_end, cs_num, ce_num
-    FROM (
-        SELECT x.*,
-               ROW_NUMBER() OVER (PARTITION BY x.MSISDN ORDER BY x.RUN_DATE DESC) AS rn,
-               MAX(CASE WHEN x.STATUS = 'ACTIVE' THEN 1 ELSE 0 END)
-                   OVER (PARTITION BY x.MSISDN)                               AS was_active
-        FROM   bscs_post x
-    )
-    WHERE rn = 1
-    AND   was_active = 1
-    AND   NVL(PRICE_GROUP,'x') NOT IN ('TEST PHONES','Pre-paid Test SIM',
-                                       'Test Individuals','Dummy PG')
-    AND   UPPER(NVL(TMCODE_DES,'x')) NOT LIKE '%SDSL%'      -- exclude SDSL
-),
+        start_time = datetime.now()
+        pcrf_edrs_dump = f"/RAIDdata/PI/PI_PRJ/exports/pcrf_edrs_*.csv"
 
--- ---------------------------------------------------------------------
--- BILLING - LAYER 2: every prepaid row in the same date range.
--- If the MSISDN is PRE on any day of ITS period -> drop the whole MSISDN.
--- (PRE after the period end is ignored.)
--- ---------------------------------------------------------------------
-bscs_pre AS (
-    SELECT /*+ MATERIALIZE PARALLEL(b 32) */ DISTINCT b.MSISDN, b.RUN_DATE
-    FROM   RP7VFEPIDAT.PFM_BSCS_ADSL b
-    WHERE  b.RUN_DATE >= (SELECT min_num FROM bounds)
-    AND    b.RUN_DATE <= (SELECT max_num FROM bounds)
-    AND    b.TYPE = 'PRE'
-),
+        con.execute(f"""
+            CREATE OR REPLACE TABLE pcrf_edrs_src AS
+            SELECT EDR_DATE, QUOTA_USAGE, SERVICE_NAME, QUOTA_NAME
+            FROM read_csv_auto('{pcrf_edrs_dump}', ignore_errors=True)
+        """)
 
-billing_ok AS (
-    SELECT b.*
-    FROM   billing b
-    WHERE  NOT EXISTS (
-               SELECT /*+ HASH_AJ */ 1
-               FROM   bscs_pre p
-               WHERE  p.MSISDN    = b.MSISDN
-               AND    p.RUN_DATE >= b.cs_num
-               AND    p.RUN_DATE <= b.ce_num
-           )
-),
+        con.execute(f"""
+            CREATE OR REPLACE TABLE free_traffic_mismatch AS
+            WITH Total_base AS (
+                SELECT TRY_CAST(EDR_DATE AS DATE) AS EDR_DATE,
+                       SUM(QUOTA_USAGE) AS Usage,
+                       'TOTAL' AS TYPE
+                FROM pcrf_edrs_src
+                WHERE TRY_CAST(EDR_DATE AS DATE) = strptime('{run_date}', '%Y%m%d')
+                GROUP BY TRY_CAST(EDR_DATE AS DATE)
+            ),
 
--- postpaid Main Bundles only: used for catalogue quota AND as the list of valid PCRF services
--- services containing _GC_ are removed here (INSTR searches the text literally)
-catalogue AS (
-    SELECT /*+ MATERIALIZE */
-           UPPER(TRIM(PCRF_SERVICE_NAME)) AS svc_key,
-           MAX(PCRF_QOUTA_VALUE_GB)       AS catalogue_quota_gb
-    FROM   RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE
-    WHERE  PROD_TYPE_NAME = 'Main Bundle'
-    AND    INSTR(UPPER(PCRF_SERVICE_NAME), '_GC_') = 0
-   -- AND    UPPER(PCRF_TYPE) = 'POSTPAID'
-    GROUP  BY UPPER(TRIM(PCRF_SERVICE_NAME))
-),
+            PRE AS (
+                SELECT TRY_CAST(EDR_DATE AS DATE) AS EDR_DATE,
+                       SUM(QUOTA_USAGE) AS Usage,
+                       'PRE' AS TYPE
+                FROM pcrf_edrs_src
+                WHERE TRY_CAST(EDR_DATE AS DATE) = strptime('{run_date}', '%Y%m%d')
+                  AND SERVICE_NAME IN (
+                      'Serv_DSL_Generic_Promo',
+                      'Serv_DSL_Seasonal_Gift',
+                      'Serv_DSL_Double_Quota_Pre',
+                      'Serv_DSL_Compensation_Gift'
+                  )
+                GROUP BY TRY_CAST(EDR_DATE AS DATE)
+            ),
 
-subs AS (
-    SELECT /*+ MATERIALIZE */
-           b.MSISDN,
-           SUBSTR(b.MSISDN, 2) AS edr_msisdn,
-           b.BILLCYCLE,
-           b.cycle_start, b.cycle_end,
-           c.catalogue_quota_gb
-    FROM   billing_ok b
-    LEFT JOIN catalogue c ON c.svc_key = UPPER(TRIM(b.PCRF_SERVICE_NAME_EXPECTED))
-),
+            POST AS (
+                SELECT TRY_CAST(EDR_DATE AS DATE) AS EDR_DATE,
+                       SUM(QUOTA_USAGE) AS Usage,
+                       'POST' AS TYPE
+                FROM pcrf_edrs_src
+                WHERE TRY_CAST(EDR_DATE AS DATE) = strptime('{run_date}', '%Y%m%d')
+                  AND (
+                      QUOTA_NAME IN ('DSL_Compensation_Gift')
+                      OR SERVICE_NAME IN (
+                          'Serv_DSL_DoubleQuota_300GB_POST',
+                          'Serv_DSL_DoubleQuota_600GB_POST',
+                          'Serv_DSL_DoubleQuota_200GB_POST',
+                          'Serv_DSL_GC_Gift_3000G'
+                      )
+                  )
+                GROUP BY TRY_CAST(EDR_DATE AS DATE)
+            )
 
-win_rows AS (
-    SELECT /*+ PARALLEL(f 32) USE_HASH(f) */
-           s.MSISDN,
-           f.SERVICE_NAME,
-           f.RUN_DATE,
-           f.QUOTA_SUM,
-           CASE WHEN LOWER(f.SERVICE_NAME) LIKE '%double%quota%' THEN 1 ELSE 0 END AS is_double
-    FROM   subs s
-    JOIN   RP7VFEPIDAT.PFM_PCRF_CONSUM_FILTERED f
-           ON  f.MSISDN   = s.MSISDN
-           AND f.RUN_DATE >= s.cycle_start
-           AND f.RUN_DATE <  s.cycle_end + 1
-    WHERE  f.RUN_DATE >= (SELECT min_start   FROM bounds)
-    AND    f.RUN_DATE <  (SELECT max_end + 1 FROM bounds)
-    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%addon%'
-    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%throttling%'
-    AND    LOWER(f.SERVICE_NAME) NOT LIKE '%promo%'
-    AND    INSTR(UPPER(f.SERVICE_NAME), '_GC_') = 0   -- also covers double quota
+            SELECT
+                t.EDR_DATE AS "TIME",
+                ROUND(t.Usage / 1024 / 1024 / 1024, 2) AS TOTAL_TB,
+                ROUND(pre.Usage / 1024 / 1024 / 1024, 2) AS PRE_FREE_TRAFFIC_TB,
+                100 - ROUND((t.Usage - pre.Usage) / NULLIF(t.Usage, 0), 4) * 100 AS PRE_PERCENTAGE,
+                ROUND(post.Usage / 1024 / 1024 / 1024, 2) AS POST_FREE_TRAFFIC_TB,
+                100 - ROUND((t.Usage - post.Usage) / NULLIF(t.Usage, 0), 4) * 100 AS POST_PERCENTAGE
+            FROM Total_base t
+            JOIN PRE pre ON t.EDR_DATE = pre.EDR_DATE
+            JOIN POST post ON t.EDR_DATE = post.EDR_DATE
+        """)
 
-    -- validation: keep only services found in the postpaid Main Bundle catalogue
-    -- (double quota is kept by name, since it is not a Main Bundle)
-    AND   ( LOWER(f.SERVICE_NAME) LIKE '%double%quota%'
-            OR UPPER(TRIM(f.SERVICE_NAME)) IN (SELECT svc_key FROM catalogue) )
-),
+        count = con.execute("SELECT COUNT(*) FROM free_traffic_mismatch").fetchone()[0]
+        logger.info(f"Total processed rows: {count}")
 
--- last quota value of each service in the cycle (not rounded yet)
-svc_last AS (
-    SELECT MSISDN, SERVICE_NAME, is_double,
-           MIN(RUN_DATE) AS first_dt,
-           MAX(RUN_DATE) AS last_dt,
-           MAX(QUOTA_SUM) KEEP (DENSE_RANK LAST ORDER BY RUN_DATE) / 1048576 AS svc_quota_gb
-    FROM   win_rows
-    GROUP  BY MSISDN, SERVICE_NAME, is_double
-),
+        logger.info(f"Exporting free_traffic_mismatch{run_date}.csv ..")
+        con.execute(f"""COPY free_traffic_mismatch TO '/project/PLATFORM_INTEGRITY/exports/free_traffic_mismatch_{run_date}.csv' (HEADER, DELIMITER ',')""")
+       
+        logger.info(f"Inserting into PI.FREE_TRAFFIC table ..")
+        ctl_file = prepare_ctl("free_traffic_mismatch", run_date)
+        run_sqlldr("free_traffic_mismatch",run_date, ctl_file=ctl_file)
+        logger.info(f"Insertion done")
+        
+        
+        end_time = datetime.now() 
+        logger.info(f"free_traffic_mismatch job finished") 
+        logger.info(f"free_traffic_mismatch total duration: {end_time - start_time}") 
+    except Exception as e: 
+        logger.exception(f"free_traffic_mismatch failed for run_date= {run_date} | error= {str(e)}") 
+        raise 
 
--- sum first, then round to whole GB
-quota_agg AS (
-    SELECT MSISDN,
-           ROUND(SUM(CASE WHEN is_double = 0 THEN svc_quota_gb END))  AS main_quota_gb,
-           COUNT(CASE WHEN is_double = 0 THEN 1 END)                  AS main_svc_cnt,
-           ROUND(SUM(CASE WHEN is_double = 1 THEN svc_quota_gb END))  AS double_quota_gb,
-           COUNT(CASE WHEN is_double = 1 THEN 1 END)                  AS double_svc_cnt,
-           MAX(CASE WHEN is_double = 0 THEN last_dt END)              AS main_last_date,
-           MAX(CASE WHEN is_double = 1 THEN last_dt END)              AS double_last_date,
-           LISTAGG(CASE WHEN is_double = 0 THEN SERVICE_NAME END, ' > ')
-               WITHIN GROUP (ORDER BY first_dt)                       AS main_services
-    FROM   svc_last
-    GROUP  BY MSISDN
-),
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_date", required=True)
+    args = parser.parse_args()
+    export_free_traffic(run_date=args.run_date)
 
-edr_agg AS (
-    -- QUOTA_CONSUMPTION is a running total per service:
-    -- take its highest value per service (= final total, records can arrive out of order),
-    -- then sum all services of the MSISDN
-    SELECT MSISDN,
-           ROUND(SUM(svc_cons) / 1048576) AS cons_edr_gb,
-           SUM(svc_sessions)              AS edr_sessions
-    FROM (
-    SELECT /*+ PARALLEL(e 32) USE_HASH(e) */
-           s.MSISDN,
-           e.SERVICE_NAME,
-           MAX(e.QUOTA_CONSUMPTION)            AS svc_cons,
-           COUNT(*)                            AS svc_sessions
-    FROM   subs s
-    JOIN   RP7VFEPIDAT.PFM_PCRF_EDRS_STG_CONSUM e
-           ON  e.MSISDN = s.edr_msisdn
-           AND e.TIME  >= s.cycle_start
-           AND e.TIME   < s.cycle_end + 1
-    WHERE  e.TIME >= (SELECT min_start   FROM bounds)
-    AND    e.TIME <  (SELECT max_end + 1 FROM bounds)
-    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%addon%'
-    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%throttling%'
-    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%promo%'
-    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%adn%'
-    AND    LOWER(e.SERVICE_NAME) NOT LIKE '%gift%'
-    AND    INSTR(UPPER(e.SERVICE_NAME), '_GC_') = 0
-    GROUP  BY s.MSISDN, e.SERVICE_NAME
-    )
-    GROUP  BY MSISDN
-),
 
-calc AS (
-    SELECT s.MSISDN, s.BILLCYCLE, s.cycle_start, s.cycle_end,
-           s.catalogue_quota_gb,
-           q.main_last_date, q.double_last_date,
-           q.main_services,
-           NVL(q.main_svc_cnt,0)                                 AS main_svc_cnt,
-           q.main_quota_gb,
-           NVL(q.double_quota_gb,0)                              AS double_quota_gb,
-           CASE WHEN NVL(q.double_svc_cnt,0) > 0 THEN 1 ELSE 0 END AS has_double,
-           NVL(q.main_quota_gb,0) + NVL(q.double_quota_gb,0)     AS allocated_gb,
-           NVL(e.cons_edr_gb,0)                                  AS cons_e,
-           NVL(e.edr_sessions,0)                                 AS edr_sessions
-    FROM   subs s
-    LEFT JOIN quota_agg q ON q.MSISDN = s.MSISDN    -- keeps customers with no PCRF data
-    LEFT JOIN edr_agg   e ON e.MSISDN = s.MSISDN
+
+
+
+
+
+    import os
+import sys
+ 
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
 )
+sys.path.insert(0, PROJECT_ROOT)
+ 
+import argparse
+from datetime import datetime, timedelta
+from config.duckdb_connection import duckdb_connection
+from utils.logger import get_logger
+from utils.export_to_oracle import prepare_ctl
+from utils.export_to_oracle import run_sqlldr
+ 
+ 
+def export_adsl_subs(run_date: str, con=None):
+ 
+    logger = get_logger(
+        flow="adsl_subs",
+        log_dir=None,
+        run_date=run_date
+    )
+ 
+    try:
+        if con is None:
+            con = duckdb_connection()
+ 
+        logger.info("###########################################################")
+        logger.info(f"###### ADSL SUBS for run_date= {run_date} ######")
+        logger.info("###########################################################")
+ 
+        start_time = datetime.now()
+ 
+        prev_date = (datetime.strptime(run_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        logger.info(f"Counting subscribers for RUN_DATE= {prev_date}")
+ 
+        bscs_dump = f"/project/PLATFORM_INTEGRITY/exports/bscs_profiles_adsl_{prev_date}*"
+        charging_dump = f"/project/PLATFORM_INTEGRITY/exports/charging_adsl_{prev_date}*"
+ 
+ 
 
-SELECT MSISDN,
-       BILLCYCLE,
-       cycle_start,
-       cycle_end,
-       TO_CHAR(cycle_end,'YYYY-MM')                                   AS cycle_month,
-       TO_CHAR(cycle_end,'FMMonth YYYY','NLS_DATE_LANGUAGE=ENGLISH')  AS cycle_month_name,
+        con.execute(f"""
+            CREATE OR REPLACE TABLE bscs_adsl_src AS
+            SELECT RUN_DATE, PCRF_SERVICE_NAME_EXPECTED, MSISDN, TYPE, TM_CODE_DESC
+            FROM read_csv_auto('{bscs_dump}', all_varchar=true, ignore_errors=True)
+        """)
+ 
+        con.execute(f"""
+            CREATE OR REPLACE TABLE charging_adsl_src AS
+            SELECT RUN_DATE, PCRF_SERVICE_NAME as PCRF_SERVICE_ID_EXPECTED , MSISDN, PROD_TYPE_NAME as PACKAGE_TYPE
+            FROM read_csv_auto('{charging_dump}', all_varchar=true, ignore_errors=True)
+        """)
+ 
 
-       CASE WHEN main_svc_cnt > 1 THEN 'Yes' ELSE 'No' END            AS service_changed,
-       main_svc_cnt                                                   AS main_services_count,
-       main_services,
+        con.execute(f"""
+            CREATE OR REPLACE TABLE adsl_subs AS
+            SELECT RUN_DATE, SERVICE_NAME, "COUNT"
+            FROM (
+                SELECT TRY_CAST(RUN_DATE AS DATE) AS RUN_DATE,
+                       PCRF_SERVICE_NAME_EXPECTED AS SERVICE_NAME,
+                       COUNT(DISTINCT MSISDN) AS "COUNT"
+                FROM bscs_adsl_src
+                WHERE TRY_CAST(RUN_DATE AS DATE) = strptime('{prev_date}', '%Y%m%d')
+                  AND "TYPE" = 'POST'
+                  AND TM_CODE_DESC NOT LIKE 'SDSL%'
+                  AND TM_CODE_DESC NOT LIKE 'Cloud%'
+                GROUP BY 1, 2
+            )
+            UNION ALL
+            SELECT RUN_DATE, SERVICE_NAME, "COUNT"
+            FROM (
+                SELECT TRY_CAST(RUN_DATE AS DATE) AS RUN_DATE,
+                       PCRF_SERVICE_ID_EXPECTED AS SERVICE_NAME,
+                       COUNT(DISTINCT MSISDN) AS "COUNT"
+                FROM charging_adsl_src
+                WHERE TRY_CAST(RUN_DATE AS DATE) = strptime('{prev_date}', '%Y%m%d')
+                  AND UPPER(PACKAGE_TYPE) = 'MAIN BUNDLE'
+                GROUP BY 1, 2
+            )
+        """)
+ 
+        count = con.execute("SELECT COUNT(*) FROM adsl_subs").fetchone()[0]
+        logger.info(f"Total processed rows: {count}")
+ 
+        if count == 0:
+            raise ValueError(f"adsl_subs produced 0 rows for RUN_DATE= {prev_date}; check source files and filters")
+ 
+        logger.info(f"Exporting adsl_subs_{run_date}.csv ..")
+        con.execute(f"""COPY adsl_subs TO '/project/PLATFORM_INTEGRITY/exports/adsl_subs_{run_date}.csv' (HEADER, DELIMITER ',')""")
+ 
+        logger.info("Inserting into RP7VFEPIDAT.ADSL_SUBS table ..")
+        ctl_file = prepare_ctl("adsl_subs", run_date)
+        run_sqlldr("adsl_subs", run_date, ctl_file=ctl_file)
+        logger.info("Insertion done")
+ 
+        end_time = datetime.now()
+        logger.info("adsl_subs job finished")
+        logger.info(f"adsl_subs total duration: {end_time - start_time}")
+    except Exception as e:
+        logger.exception(f"adsl_subs failed for run_date= {run_date} | error= {str(e)}")
+        raise
+ 
+ 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_date", required=True)
+    args = parser.parse_args()
+    export_adsl_subs(run_date=args.run_date)
 
-       main_last_date                                                 AS main_quota_date,
-       main_quota_gb,
-       CASE WHEN has_double = 1 THEN 'Yes' ELSE 'No' END              AS double_quota,
-       double_last_date                                               AS double_quota_date,
-       double_quota_gb,
-       allocated_gb                                                   AS total_allocated_gb,
 
-       catalogue_quota_gb,
-       CASE WHEN catalogue_quota_gb > 0
-            THEN TRUNC(main_quota_gb / catalogue_quota_gb) END        AS main_quota_renewals,
 
-       edr_sessions,
-       cons_e                                                         AS total_consumed_gb,
-       ROUND(cons_e / NULLIF(allocated_gb,0) * 100, 2)                AS consumption_pct,
-       allocated_gb - cons_e                                          AS variance_gb,
-       ROUND((allocated_gb - cons_e) / NULLIF(allocated_gb,0) * 100, 2) AS variance_pct,
 
-       CASE WHEN allocated_gb = 0 AND cons_e = 0 THEN 'Both not found'
-            WHEN allocated_gb = 0                THEN 'No allocated found'
-            WHEN cons_e = 0                      THEN 'No consumption found'
-            WHEN cons_e >= allocated_gb          THEN 'Finisher'
-            ELSE 'Non-Finisher' END                                   AS finisher_status,
-       CASE WHEN allocated_gb = 0 OR cons_e = 0
-              OR cons_e >= allocated_gb THEN NULL
-            WHEN cons_e / allocated_gb < 0.25 THEN 'CAT1'
-            WHEN cons_e / allocated_gb < 0.50 THEN 'CAT2'
-            WHEN cons_e / allocated_gb < 0.75 THEN 'CAT3'
-            ELSE                                   'CAT4'
-       END                                                            AS consumption_category
-FROM   calc;
 
-COMMIT;
-EXIT;
+    based on the two above queries i want to create another one for the following :
+SELECT *
+FROM
+(
+    SELECT DISTINCT
+           TO_DATE(consum.run_date,'YYYYMMDD') AS run_date,
+           consum.msisdn,
+           consum.service_name,
+           ROUND(consum.quota_sum/1024/1024,1) AS quota_sum_gb,
+           expected_org_quota,
+           expected_tax_quota,
+
+           CASE
+                WHEN ROUND(quota_sum/1024/1024,1) = expected_org_quota
+                THEN 0
+
+                WHEN ROUND(quota_sum/1024/1024,1) =
+                     (expected_org_quota + expected_tax_quota)
+                     AND pcrf_type LIKE '%PREPAID%'
+                     AND prod_type_name = 'Main Bundle'
+                THEN 0
+
+                WHEN ROUND(quota_sum/1024/1024,1) <>
+                     (expected_org_quota + expected_tax_quota)
+                     AND pcrf_type LIKE '%PREPAID%'
+                     AND prod_type_name = 'Main Bundle'
+                THEN ROUND(quota_sum/1024/1024,1)
+                     - (expected_org_quota + expected_tax_quota)
+
+                ELSE ROUND(quota_sum/1024/1024,1)
+                     - expected_org_quota
+           END AS variance,
+
+           CASE
+                WHEN pcrf_type IS NULL THEN 'NA'
+                ELSE pcrf_type
+           END AS pcrf_type,
+
+           CASE
+                WHEN expected_org_quota = 0
+                 AND expected_tax_quota = 0
+                 AND expected_throt_quota = 0
+                THEN 'EXCLUDED'
+                ELSE 'INCLUDED'
+           END AS lookup_inclusion
+
+    FROM RP7VFEPIDAT.PFM_PCRF_STG_CONSUM_FILTERED consum
+
+    LEFT OUTER JOIN
+    (
+        SELECT pcrf_service_name,
+               pcrf_type,
+               prod_type_name
+        FROM RP7VFEPIDAT.RD_T_DSL_PRODUCT_CATALOGUE
+    ) catalogue
+        ON consum.service_name = catalogue.pcrf_service_name
+
+    WHERE consum.msisdn IN
+    (
+        SELECT msisdn
+        FROM RP7VFEPIDAT.PFM_PCRF_STG_FILTERED
+        WHERE customer_status = 1
+    )
+) t
+
+WHERE variance <> 0
+  AND service_name NOT LIKE '%Thrott%'
+  AND service_name NOT LIKE '%Double%'
+  AND service_name NOT LIKE '%Gift%'
+  AND service_name NOT LIKE '%Promo%'
+  AND quota_sum_gb NOT IN
+      (
+          expected_org_quota * 2,
+          expected_org_quota * 3,
+          expected_org_quota * 4,
+          expected_org_quota * 5
+      );
+	  
+	  
+	  
+	  
+	  
+tables to select from  : PFM_PCRF_STG_FILTERED , PFM_PCRF_STG_CONSUM_FILTERED , RD_T_DSL_PRODUCT_CATALOGUE
+	  
+	  
+
+
+
+i will you the dumps name we're using? 
+
+PFM_PCRF_STG_CONSUM_FILTERED  : path and columns 
+/RAIDdata/PI/PI_PRJ/exports/pcrf_edrs_consum_20261020.csv
+cat pcrf_edrs_consum_20261020.csv | head
+RUN_DATE,MSISDN,SERVICE_NAME,QUOTA_NAME,QUOTA_STATUS,QUOTA_CONSUMPTION,QUOTA_USAGE,QUOTA_VALUE,ACTUAL_QUOTA_USAGE,SERVICE_EXTENDED_ATTRIBUTE1,EXPECTED_ORG_QUOTA,EXPECTED_TAX_QUOTA
+2026-10-20,20862161873,,ADSL_HS_30M_300G_Main,Normal,105263090,2507000,2507000,2507000,4440,,
+2026-10-20,20653630716,,ADSL_HS_30M_140G_Main,Normal,25090627,20828,20828,20828,4440,,
+
+
+PFM_PCRF_STG_FILTERED
+/RAIDdata/PI/PI_PRJ/exports/pcrf_20261020.csv
+cat pcrf_20261020.csv | head
+MSISDN,BILLCYCLE,SERVICE_NAME,SVC_PKG_NAME,VALID_DATE,EXPIRY_DATE,CUSTOMER_STATUS,RUN_DATE,THROT,PROD_TYPE_NAME,RN
+20643204513,18,Serv_ADSL_Mc_HS_30M_600G,,2026-10-17 11:13:26,2026-11-16 00:00:00,1,2026-10-20,0,Main Bundle,1
+20643204580,18,Serv_DSL_Throttling,,2026-10-14 00:47:36,,1,2026-10-20,0,,1
+20643204618,18,Serv_ADSL_Mc_HS_30M_180G,,2026-10-02 18:19:51,2026-11-01 00:00:00,1,2026-10-20,0,Main Bundle,1
+20643205110,18,Serv_DSL_Throttling,,2026-09-23 03:51:18,,1,2026-10-20,0,,1
+
+
+
+RD_T_DSL_PRODUCT_CATALOGUE  this is lookup i want will give you a query when this lookup is used i want you to explain to me how this lookup work?
+
+
+con.execute(f"""
+            CREATE OR REPLACE TABLE pcrf_edrs_consum AS
+            SELECT
+            TRY_CAST('{run_date_formatted}' AS DATE) AS RUN_DATE,
+            TRY_CAST('2' || column02 AS VARCHAR) AS MSISDN,
+            TRY_CAST(column13 AS VARCHAR) AS SERVICE_NAME,
+            TRY_CAST(column14 AS VARCHAR) AS QUOTA_NAME,
+            TRY_CAST(column15 AS VARCHAR) AS QUOTA_STATUS,
+            TRY_CAST(column16 AS DOUBLE) AS QUOTA_CONSUMPTION,
+            TRY_CAST(column17 AS DOUBLE) AS QUOTA_USAGE,
+            TRY_CAST(column17 AS VARCHAR) AS QUOTA_VALUE,
+            TRY_CAST(column30 AS VARCHAR) AS ACTUAL_QUOTA_USAGE,
+            TRY_CAST(column35 AS VARCHAR) AS SERVICE_EXTENDED_ATTRIBUTE1,
+            TRY_CAST(lkp15.PCRF_QOUTA_VALUE_GB AS VARCHAR) AS EXPECTED_ORG_QUOTA,
+            TRY_CAST(lkp16.PCRF_TAXATION_VALUE_GB AS VARCHAR) AS EXPECTED_TAX_QUOTA
+        FROM read_csv_auto('{file_pattern}', ignore_errors=True,delim=',',union_by_name = true,auto_detect = true) pcrf_edrs_consum
+        LEFT JOIN lkp15
+            ON TRY_CAST(pcrf_edrs_consum.column13 AS VARCHAR) = TRY_CAST(lkp15.PCRF_QOUTA_VALUE_GB AS VARCHAR)
+        LEFT JOIN lkp16
+            ON TRY_CAST(pcrf_edrs_consum.column13 AS VARCHAR) = TRY_CAST(lkp16.PCRF_TAXATION_VALUE_GB AS VARCHAR)
+        LEFT JOIN lkp20233
+            ON TRY_CAST(pcrf_edrs_consum.column14 AS VARCHAR) = TRY_CAST(lkp20233.PCRF_SERVICE_NAME AS VARCHAR)
+""")
+
+
+result = con.query(f"""
+WITH edrs AS (
+    SELECT
+        RUN_DATE,
+        MSISDN,
+        SUM(QUOTA_USAGE) AS QUOTA_USAGE_SUM
+        FROM pcrf_edrs_consum
+    GROUP BY
+        RUN_DATE,
+        MSISDN
+),
+procera_agg_2 AS (
+    SELECT
+        RUN_DATE,
+        LANDLINE,
+        SUM(TOTAL_BYTES) AS total_bytes
+    FROM procera_agg
+    GROUP BY
+        RUN_DATE,
+        LANDLINE
+),
+
+comparison AS (
+SELECT
+        COALESCE(procera_agg_2.RUN_DATE, edrs.RUN_DATE - INTERVAL 1 DAY) AS RUN_DATE,
+        edrs.MSISDN AS EDRS_LANDLINE,
+        procera_agg_2.LANDLINE AS PROCERA_LANDLINE,
+        edrs.QUOTA_USAGE_SUM AS EDRS_CONSUMPTION,
+        procera_agg_2.total_bytes / 1024.0 AS PROCERA_CONSUMPTION,
+        COALESCE(procera_agg_2.total_bytes / 1024.0, 0) - COALESCE(edrs.QUOTA_USAGE_SUM, 0) AS VARIANCE
+  lkp15   this is the catlouge lookup i want to understand how it works?
+
+  import duckdb
+from pathlib import Path
+
+def load_lookups(con, directory="/project/PLATFORM_INTEGRITY/lookups"):
+    lookup_tables = {}
+    for parquet_file in Path(directory).glob("*.parquet"):
+        table_name = parquet_file.stem  # filename without .parquet
+        rel = con.query(f"SELECT * FROM read_parquet('{parquet_file}')")
+        con.register(table_name, rel)
+        lookup_tables[table_name] = rel
+    return lookup_tables
+
+#create duckdb connection with below config
+def duckdb_connection():
+    con = duckdb.connect()
+    con.execute("SET memory_limit='120GB'")
+    con.execute("SET threads=16")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute("PRAGMA temp_directory='/project/PLATFORM_INTEGRITY/duckdb_tmp'")
+    con.execute("PRAGMA max_temp_directory_size='800GB'")
+    con.execute("LOAD excel")
+    load_lookups(con, "/project/PLATFORM_INTEGRITY/lookups")
+    return con
+this is the connection it imports all the lookup i wan to understand i will give you samples of the lookup 
+
+ lkp1019.parquet
+-rw-rw-r-- 1 raidprd raidprd  11K OCT 19 2026 13:29 export_rateplans.parquet
+-rw-rw-r-- 1 raidprd raidprd 3.6K OCT 19 2026 15:23 lkp16.parquet
+-rw-rw-r-- 1 raidprd raidprd 3.7K OCT 19 2026 15:24 lkp15.parquet
+-rw-rw-r-- 1 raidprd raidprd 1.9K OCT 21 2026 13:05 LK_TMCODE_VS_SERVICE_NAME.parquet
+drwxrwxr-x 2 raidprd raidprd 4.0K OCT 21 2026 13:05 csv_lookups
+-rw-rw-r-- 1 raidprd raidprd 5.0K NOV 07 2026 11:30 lkp20233.parquet
+-rw-r--r-- 1 raidprd raidprd  11K NOV 07 2026 11:30 rateplan_mapping.parquet
+-rw-r--r-- 1 raidprd raidprd  15K NOV 07 2026 11:30 services_mapping.parquet
+-rw-r--r-- 1 raidprd raidprd 9.6K NOV 07 2026 11:30 PC_DSL.parquet
+-rw-r--r-- 1 raidprd raidprd  15K NOV 07 2026 11:30 LK_SERVICE_CLASSES.parquet
+drwxrwxr-x 2 raidprd raidprd  20K NOV 07 2026 11:30 old_lookups
+
+ARROW:schema▒/////4gCAAAQAAAAAAAKAA4ABgAFAAgACgAAAAABBAAQAAAAAAAKAAwAAAAEAAgACgAAANABAAAEAAAAAQAAAAwAAAAIAAwABAAIAAgAAACoAQAABAAAAJsBAAB7ImluZGV4X2NvbHVtbnMiOiBbXSwgImNvbHVtbl9pbmRleGVzIjogW10sICJjb2x1bW5zIjogW3sibmFtZSI6ICJQQ1JGX1NFUlZJQ0VfTkFNRSIsICJmaWVsZF9uYW1lIjogIlBDUkZfU0VSVklDRV9OQU1FIiwgInBhbmRhc190eXBlIjogInVuaWNvZGUiLCAibnVtcHlfdHlwZSI6ICJvYmplY3QiLCAibWV0YWRhdGEiOiBudWxsfSwgeyJuYW1lIjogIlBDUkZfUU9VVEFfVkFMVUVfR0IiLCAiZmllbGRfbmFtZSI6ICJQQ1JGX1FPVVRBX1ZBTFVFX0dCIiwgInBhbmRhc190eXBlIjogInVuaWNvZGUiLCAibnVtcHlfdHlwZSI6ICJvYmplY3QiLCAibWV0YWRhdGEiOiBudWxsfV0sICJjcmVhdG9yIjogeyJsaWJyYXJ5IjogInB5YXJyb3ciLCAidmVyc2lvbiI6ICIyMC4wLjAifSwgInBhbmRhc192ZXJzaW9uIjogIjIuMy4yIn0ABgAAAHBhbmRhcwAAAgAAAEwAAAAEAAAAzP///wAAAQUQAAAAJAAAAAQAAAAAAAAAEwAAAFBDUkZfUU9VVEFfVkFMVUVfR0IAvP///xAAFAAIAAYABwAMAAAAEAAQAAAAAAABBRAAAAAoAAAABAAAAAAAAAARAAAAUENSRl9TRVJWSUNFX05BTUUAAAAEAAQABAAAAAAAAAA= parquet-cpp-arrow version 20.0.0,▒PAR1[V25OIbrahim15@DCHQRAIDAPP02-N lookups]$ xterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256cm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256colorxterm-256color
+
+
+  this is the lookup when i can 
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+    
