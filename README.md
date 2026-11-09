@@ -1,75 +1,106 @@
+import os
+import sys
 
-Truncate table pfm_adsl_msisdn;
-Truncate table pfm_adsl_msisdn_dups;
-COMMIT;
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
 
-INSERT INTO PFM_ADSL_MSISDN
-SELECT MSISDN,RUN_DATE FROM PFM_BSCS_ADSL_STG;
-
-COMMIT;
-
-INSERT INTO PFM_ADSL_MSISDN
-SELECT MSISDN,TO_NUMBER(RUN_DATE) FROM RD_T_IN_ADSL;
-
-COMMIT;
-
-INSERT INTO PFM_ADSL_MSISDN
-SELECT MSISDN,RUN_DATE FROM PFM_RADIUS_STG;
-
-COMMIT;
-
-INSERT INTO PFM_ADSL_MSISDN
-SELECT MSISDN,RUN_DATE FROM PFM_PCRF_STG;
-
-COMMIT;
+import argparse
+from datetime import datetime
+from config.duckdb_connection import duckdb_connection
+from utils.logger import get_logger
+from utils.export_to_oracle import prepare_ctl
+from utils.export_to_oracle import run_sqlldr
 
 
-INSERT INTO PFM_ADSL_MSISDN_DUPS
-SELECT MSISDN,RUN_DATE FROM PFM_ADSL_MSISDN
-GROUP BY MSISDN,RUN_DATE
-HAVING count(1) > 1;
+def export_pfm_adsl_msisdn(run_date: str, con=None):
 
-COMMIT;
+    logger = get_logger(
+        flow="pfm_adsl_msisdn",
+        log_dir=None,
+        run_date=run_date
+    )
 
-DELETE FROM PFM_ADSL_MSISDN
-WHERE MSISDN IN (
-SELECT MSISDN FROM PFM_ADSL_MSISDN_DUPS);
+    try:
+        if con is None:
+            con = duckdb_connection()
 
-COMMIT;
+        logger.info("###########################################################")
+        logger.info(f"###### pfm_adsl_msisdn for run_date= {run_date} ######")
+        logger.info("###########################################################")
+
+        start_time = datetime.now()
+
+        bscs_dump = f"/project/PLATFORM_INTEGRITY/exports/bscs_profiles_adsl_{run_date}*"   
+        charging_dump = f"/project/PLATFORM_INTEGRITY/exports/charging_adsl_{run_date}*"    
+        radius_dump = f"/project/PLATFORM_INTEGRITY/exports/radius_{run_date}*"             
+        pcrf_dump = f"/project/PLATFORM_INTEGRITY/exports/pcrf_{run_date}*"                 
+
+        con.execute(f"""
+            CREATE OR REPLACE TABLE bscs_src AS
+            SELECT MSISDN, RUN_DATE
+            FROM read_csv_auto('{bscs_dump}', all_varchar=true, ignore_errors=True)
+        """)
+
+        con.execute(f"""
+            CREATE OR REPLACE TABLE charging_src AS
+            SELECT MSISDN, RUN_DATE
+            FROM read_csv_auto('{charging_dump}', all_varchar=true, ignore_errors=True)
+        """)
+
+        con.execute(f"""
+            CREATE OR REPLACE TABLE radius_src AS
+            SELECT MSISDN, RUN_DATE
+            FROM read_csv_auto('{radius_dump}', all_varchar=true, ignore_errors=True)
+        """)
+
+        con.execute(f"""
+            CREATE OR REPLACE TABLE pcrf_src AS
+            SELECT MSISDN, RUN_DATE
+            FROM read_csv_auto('{pcrf_dump}', all_varchar=true, ignore_errors=True)
+        """)
+
+        for t in ("bscs_src", "charging_src", "radius_src", "pcrf_src"):
+            n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            logger.info(f"{t}: {n} rows")
+
+        con.execute("""
+            CREATE OR REPLACE TABLE pfm_adsl_msisdn AS
+            SELECT DISTINCT MSISDN, RUN_DATE
+            FROM (
+                SELECT MSISDN, RUN_DATE FROM bscs_src
+                UNION ALL
+                SELECT MSISDN, RUN_DATE FROM charging_src
+                UNION ALL
+                SELECT MSISDN, RUN_DATE FROM radius_src
+                UNION ALL
+                SELECT MSISDN, RUN_DATE FROM pcrf_src
+            )
+        """)
+
+        count = con.execute("SELECT COUNT(*) FROM pfm_adsl_msisdn").fetchone()[0]
+        logger.info(f"Total processed rows: {count}")
+
+        if count == 0:
+            raise ValueError(f"pfm_adsl_msisdn produced 0 rows for RUN_DATE= {run_date}; check source files")
+
+        logger.info(f"Exporting pfm_adsl_msisdn_{run_date}.csv ..")
+        con.execute(f"""COPY pfm_adsl_msisdn TO '/project/PLATFORM_INTEGRITY/exports/pfm_adsl_msisdn_{run_date}.csv' (HEADER, DELIMITER ',')""")
+
+        logger.info("Inserting into PFM_ADSL_MSISDN table ..")
+        ctl_file = prepare_ctl("pfm_adsl_msisdn", run_date)
+        run_sqlldr("pfm_adsl_msisdn", run_date, ctl_file=ctl_file)
+        logger.info("Insertion done")
+
+        end_time = datetime.now()
+        logger.info("pfm_adsl_msisdn job finished")
+        logger.info(f"pfm_adsl_msisdn total duration: {end_time - start_time}")
+    except Exception as e:
+        logger.exception(f"pfm_adsl_msisdn failed for run_date= {run_date} | error= {str(e)}")
+        raise
 
 
-INSERT INTO PFM_ADSL_MSISDN
-SELECT MSISDN,RUN_DATE FROM PFM_ADSL_MSISDN_DUPS;
-
-COMMIT;
-
-
-exec dbms_stats.gather_table_stats(ownname=>'RP7VFEPIDAT', tabname=>'PFM_ADSL_MSISDN', estimate_percent => 15, degree => 
-
-
-
-i want to creat ethe following as duckdb script that reads from the following files and exports as file as well.
-
-PFM_BSCS_ADSL_STG: name it bscs : /RAIDdata/PI/PI_PRJ/exports//project/PLATFORM_INTEGRITY/exports/bscs_profiles_adsl_{run_date}
-
-2- RD_T_IN_ADSL charging_dump = f"/project/PLATFORM_INTEGRITY/exports/charging_adsl_{run_date}*"
-
-3- PFM_RADIUS_STG  radius= f"/project/PLATFORM_INTEGRITY/exports/radius_{run_date}*"
-
-4- PFM_PCRF_STG  pcrf  = f"/project/PLATFORM_INTEGRITY/exports/pcrf_{run_date}*"
-
-
-read from the dources above as tables then create file to export with 
-/project/PLATFORM_INTEGRITY/exports/pfm_adsl_msisdn_{run_date}
-
-is thi clear tell me what did u understood? 
-
-
-
-
-
-
-
-4, cascade => true, method_opt => 'FOR ALL COLUMNS SIZE AUTO');
-
-EXIT;
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_date", required=True)
+    args = parser.parse_args()
+    export_pfm_adsl_msisdn(run_date=args.run_date)
