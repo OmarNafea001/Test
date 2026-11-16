@@ -37,19 +37,6 @@ def load_radius(run_date: str, con=None):
 
         con.execute(f"""
             CREATE OR REPLACE TABLE radius_data AS
-            WITH raw AS (
-                SELECT
-                    TRY_CAST(ADSL_USER_NAME AS VARCHAR) AS ADSL_USER_NAME,
-                    TRY_CAST(ADSL_STATUS    AS VARCHAR) AS ADSL_STATUS,
-                    TRY_CAST(CREATION_DATE  AS VARCHAR) AS CREATION_DATE
-                FROM read_csv_auto(
-                    '{file_path}',
-                    delim=',',
-                    header=TRUE,
-                    ignore_errors=TRUE,
-                    quote='"'
-                )
-            )
             SELECT
                 '2' || ADSL_USER_NAME AS MSISDN,
 
@@ -59,14 +46,18 @@ def load_radius(run_date: str, con=None):
                     ELSE ADSL_STATUS
                 END AS STATUS,
 
-                CASE
-                    WHEN CREATION_DATE IS NULL OR CREATION_DATE = '' THEN ''
-                    ELSE CREATION_DATE
-                END AS CREATION_DATE,
+                COALESCE(CREATION_DATE, '') AS CREATION_DATE,
 
                 TRY_CAST('{run_date_formatted}' AS DATE) AS RUN_DATE
 
-            FROM raw;
+            FROM read_csv_auto(
+                '{file_path}',
+                delim=',',
+                header=TRUE,
+                ignore_errors=TRUE,
+                quote='"',
+                all_varchar=TRUE
+            );
         """)
 
         count = con.execute("SELECT COUNT(*) FROM radius_data").fetchone()[0]
