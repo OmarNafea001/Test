@@ -1,229 +1,182 @@
-import os
-import sys
-
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
-)
-sys.path.insert(0, PROJECT_ROOT)
-
-import duckdb
-import argparse
-import glob
-from datetime import datetime
-from config.duckdb_connection import duckdb_connection
-from utils.logger import get_logger
-from utils.send_mail import send_mail
-from utils.export_to_oracle import prepare_ctl
-from utils.export_to_oracle import run_sqlldr
-from utils.dump_vs_database import validate_loaded_data
-
-
-# Positional mapping (read_csv with header=False -> column00 .. column19)
-#    rdrCONTRACT_ID          (index 1)
-#    rdrIMSI                 (index 2)
-#    rdrRUNNING_NUMBER       (index 3)
-#    rdrTM_CODE              (index 7)
-#    rdrSUB_STATUS           (index 8)
-#    rdrSUB_TYPE             (index 9)
-#    rdrMSISDN               (index 10)
-#    rdrSN_CODE              (index 11)
-#    rdrBILL_CYCLE           (index 14)
-#    TMCODE_DES              (index 16)
-#    rdrACTIVE_SERVICE_LIST  (index 19)
-#    rdrPRICE_GROUP          (index 20)
-
-
-def load_bscs_profiles_adsl(run_date: str, con=None):
-
-    start_time = datetime.now()
-    logger = get_logger(
-        flow="bscs_profiles_adsl",
-        log_dir=None,
-        run_date=run_date
-    )
-
-    try:
-        if con is None:
-            con = duckdb_connection()
-
-        csv_path = f"/project/PLATFORM_INTEGRITY/exports/bscs_profiles_adsl_{run_date}.csv"
-        
-        file_path = (
-            f"/RAIDdata/PI/BSCS/raw/"
-            f"CONTRACT_PROFILE_{run_date}.csv.gz"
-        )
-
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Input file not found: {file_path}")
-
-        logger.info(f"Reading {file_path} ..")
-
-        con.execute(f"""
-        CREATE OR REPLACE TABLE bscs_profiles_adsl_data AS
-        WITH src AS (
-        SELECT
-        COALESCE(TRIM(TRY_CAST(column00 AS VARCHAR)), '') AS CONTRACT_ID,
-        RTRIM(COALESCE(TRIM(TRY_CAST(column09 AS VARCHAR)), ''), '`') AS MSISDN,
-        COALESCE(TRIM(TRY_CAST(column07 AS VARCHAR)), '') AS SUB_STATUS,
-        COALESCE(TRIM(TRY_CAST(column06 AS VARCHAR)), '') AS TM_CODE,
-        COALESCE(TRIM(TRY_CAST(column08 AS VARCHAR)), '') AS SUB_TYPE,
-        COALESCE(TRIM(TRY_CAST(column10 AS VARCHAR)), '') AS SN_CODE,
-        COALESCE(TRIM(TRY_CAST(column13 AS VARCHAR)), '') AS BILL_CYCLE,
-        COALESCE(TRIM(TRY_CAST(column15 AS VARCHAR)), '') AS TMCODE_DES,
-        COALESCE(TRIM(TRY_CAST(column18 AS VARCHAR)), '') AS ACTIVE_SERVICE_LIST,
-        COALESCE(TRIM(TRY_CAST(column19 AS VARCHAR)), '') AS PRICE_GROUP,
-
-        -- RUN_DATE extracted from the file name (XML: RegExpPart .*_.*_([0-9]*).*)
-        regexp_extract(
-            regexp_extract(filename, '[^/]+$'),
-            '.*_.*_([0-9]*).*',
-            1
-        ) AS EXTRACT_DATE
-
-    FROM read_csv_auto('{file_path}',delim='|',header=FALSE,all_varchar=TRUE,quote='',escape='',null_padding=TRUE,filename=TRUE,ignore_errors=TRUE)
-        ),
-
-        -- one value per TM_CODE so the join can never duplicate rows
-        lkp AS (
-            SELECT
-                TRIM(TRY_CAST(TMCODE AS VARCHAR)) AS TMCODE,
-                ANY_VALUE(COALESCE(TRIM(TRY_CAST(PCRF_SERVICE_NAME AS VARCHAR)), '')) AS PCRF_SERVICE_NAME
-            FROM lkp17
-            GROUP BY 1
-        )
-
-        SELECT
-            TRY_CAST(STRPTIME(src.EXTRACT_DATE, '%Y%m%d') AS DATE) AS RUN_DATE,
-
-            src.CONTRACT_ID,
-            src.MSISDN,
-            src.TM_CODE,
-
-            CASE
-                WHEN UPPER(src.SUB_STATUS) = 'A' THEN 'ACTIVE'
-                WHEN UPPER(src.SUB_STATUS) = 'S' THEN 'SUSPENDED'
-                ELSE 'DEACTIVE'
-            END AS STATUS,
-
-            CASE
-                WHEN src.SUB_TYPE = 'PREPAID'    THEN 'PRE'
-                WHEN src.SUB_TYPE = 'POSTPAID'   THEN 'POST'
-                WHEN src.SUB_TYPE = 'C2BCONTROL' THEN 'CTRL'
-                WHEN src.SUB_TYPE = 'CONTROL'    THEN 'CTRL'
-                ELSE src.SUB_TYPE
-            END AS TYPE,
-
-            src.BILL_CYCLE,
-            src.TMCODE_DES AS TM_CODE_DESC,
-            src.PRICE_GROUP,
-
-            CASE
-                WHEN l.TMCODE IS NOT NULL THEN l.PCRF_SERVICE_NAME
-                ELSE '_N'
-            END AS PCRF_SERVICE_NAME_EXPECTED,
-
-            CASE
-                WHEN (',' || src.ACTIVE_SERVICE_LIST || ',') LIKE '%,505,%'
-                OR (',' || src.ACTIVE_SERVICE_LIST || ',') LIKE '%,507,%'
-                THEN 1
-                ELSE 0
-            END AS AUTO_ACTIVATION_FLAG
-
-        FROM src
-        LEFT JOIN lkp l
-            ON src.TM_CODE = l.TMCODE
-
-        WHERE src.SN_CODE = '504' AND UPPER(src.SUB_STATUS) IN ('A','S');
-        """)
-
-        count = con.execute(
-            "SELECT COUNT(*) FROM bscs_profiles_adsl_data"
-        ).fetchone()[0]
-        logger.info(f"Total processed rows: {count}")
-
-        con.execute(f"""
-        COPY (
-            SELECT RUN_DATE, CONTRACT_ID, MSISDN, TM_CODE, STATUS, TYPE,
-                   BILL_CYCLE, TM_CODE_DESC, PRICE_GROUP,
-                   PCRF_SERVICE_NAME_EXPECTED, AUTO_ACTIVATION_FLAG
-            FROM bscs_profiles_adsl_data
-        )
-        TO '{csv_path}'
-        (DELIMITER ',', HEADER TRUE, QUOTE '"', ESCAPE '"');
-        """)
-
-        print("Copied successfully..")
-
-        if count == 0:
-            logger.info("No bscs_profiles_adsl data processed!")
-            raise ValueError("No bscs_profiles_adsl data processed (0 rows)")
-
-        
-        # logger.info("Inserting into PI.BSCS_PROFILES_ADSL table ..")
-        # ctl_file = prepare_ctl("bscs_profiles_adsl", run_date)
-        # run_sqlldr("bscs_profiles_adsl", run_date, ctl_file=ctl_file)
-        # logger.info("Insertion done")
-        # logger.info("Validating inserted data ..")
-
-        # validate_loaded_data(
-        #     flow_name="bscs_profiles_adsl",
-        #     run_date=run_date,
-        #     expected_rows=count,
-        #     logger=logger)
-
-        # logger.info("Inserted data validated successfully.")
-
-        # end_time = datetime.now()
-        # logger.info("bscs_profiles_adsl finished")
-        # logger.info(f"Total duration: {end_time - start_time}")
-        # send_mail(
-        #     subject="BSCS_PROFILES_ADSL Flow Finished",
-        #     content=f"""
-        #         Run Date : {run_date}
-        #         Rows      : {count}
-        #         DB Validation : Passed
-        #         Duration  : {end_time - start_time}""")
-
-        return con.table("bscs_profiles_adsl_data")
-
-    except Exception as e:
-        logger.exception(
-            f"BSCS_PROFILES_ADSL failed for run_date= {run_date} | error= {str(e)}"
-        )
-        send_mail(
-            subject="BSCS_PROFILES_ADSL Flow Failed",
-            content=f"""
-            Run Date : {run_date}
-            Error:
-            {str(e)}
-            """)
-        raise
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run_date", required=True)
-    args = parser.parse_args()
-    load_bscs_profiles_adsl(run_date=args.run_date)
-
-
-
-i have some stuff i want to change 
-take the rundate from the paramter rundate i give why are you extract from filename
- lkp AS (
-            SELECT
-                TRIM(TRY_CAST(TMCODE AS VARCHAR)) AS TMCODE,
-                ANY_VALUE(COALESCE(TRIM(TRY_CAST(PCRF_SERVICE_NAME AS VARCHAR)), '')) AS PCRF_SERVICE_NAME
-            FROM lkp17
-            GROUP BY 1
-        )   explain whay is any_value do?  and why i usie trim 
-
-
-
-        why i use  COALESCE(TRIM(TRY_CAST(column06 AS VARCHAR)), '') AS TM_CODE,
-        COALESCE(TRIM(TRY_CAST(column08 AS VARCHAR)), '') AS SUB_TYPE,
-        COALESCE(TRIM(TRY_CAST(column10 AS VARCHAR)), '') AS SN_CODE,
-        COALESCE(TRIM(TRY_CAST(column13 AS VARCHAR)), '') AS BILL_CYCLE,
-        COALESCE(TRIM(TRY_CAST(column15 AS VARCHAR)), '') AS TMCODE_DES,
-        COALESCE(TRIM(TRY_CAST(column18 AS VARCHAR)), '') AS ACTIVE_SERVICE_LIST,
-        COALESCE(TRIM(TRY_CAST(column19 AS VARCHAR)), '') AS PRICE_GROUP,     coalsecse and trim in all values can i just add a paramter to the reader file?   if ididn;;t use coalesce what will happened? 
+RUN_DATE               |MSISDN     |BILLING_TYPE|BILLING_STATUS  |CHARGING_STATUS|PCRF_STATUS  |RADIUS_STATUS|ADSL_STATUS|NOPCRFSERVICE_STATUS|IMPACT_CASES       |
+-----------------------+-----------+------------+----------------+---------------+-------------+-------------+-----------+--------------------+-------------------+
+2026-11-25 00:00:00.000|20244856056|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20502366795|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20222559150|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20932783672|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20572226849|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235699133|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|2033095385 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20402225205|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|2035076267 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20572192220|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|2033344437 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552823237|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20553701261|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20402526209|PRE         |ACTIVE          |_N             |NoPCRFService|ACTIVE       |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20623473279|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20464908734|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20221866530|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20572173063|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20962938188|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20237012576|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20934396459|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20862430351|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20132473068|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20952331171|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20403561323|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20453454559|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20842274012|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20862409834|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20228912019|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20402230463|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20882485934|PRE         |ACTIVE          |_N             |NoPCRFService|ACTIVE       |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20226501953|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|2033924580 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20482087928|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20863987333|PRE         |NoAutoActivation|_N             |ACTIVE       |ACTIVE       |_N         |                    |Revenue Loss       |
+2026-11-25 00:00:00.000|20452381403|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20932776980|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552592093|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20228622482|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20237244223|PRE         |ACTIVE          |_N             |NoPCRFService|ACTIVE       |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20244324708|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20663697814|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20572523341|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20502704751|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20243102335|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20227034563|PRE         |NoAutoActivation|_N             |ACTIVE       |ACTIVE       |_N         |                    |Revenue Loss       |
+2026-11-25 00:00:00.000|20222363266|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20224713846|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238437236|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20222792357|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20453702662|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20663667282|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|2033586642 |PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20453305312|PRE         |ACTIVE          |_N             |NoPCRFService|ACTIVE       |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20228585625|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20683625365|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20223383132|PRE         |ACTIVE          |_N             |NoPCRFService|DEACTIVE     |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20452541178|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20222371624|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20226072811|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20884760572|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238699265|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20237784110|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20223800544|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20224219716|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20133413532|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20934730953|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20233562187|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20223820191|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20473897479|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20963100200|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20233827261|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552366454|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20244721846|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20824404501|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20404686112|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20224794865|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|2033240828 |PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|2035768616 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20882604205|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238090283|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20504685907|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20236705273|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20502533556|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235192621|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20227637187|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20472420819|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20404326171|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20223844078|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20228727049|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20884870739|PRE         |ACTIVE          |_N             |NoPCRFService|ACTIVE       |_N         |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20224141059|PRE         |ACTIVE          |_N             |SUSPENDED    |DEACTIVE     |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20225451321|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20244708510|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20962573601|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552616405|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20623445687|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238949278|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20132507378|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20974661205|PRE         |ACTIVE          |ACTIVE         |SUSPENDED    |ACTIVE       |ACTIVE     |                    |Customer Experience|
+2026-11-25 00:00:00.000|2035365348 |PRE         |ACTIVE          |ACTIVE         |SUSPENDED    |ACTIVE       |ACTIVE     |                    |Customer Experience|
+2026-11-25 00:00:00.000|2033233612 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20962473626|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20228675040|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20504955989|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20572522882|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20402222118|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20228610282|PRE         |ACTIVE          |SUSPENDED      |NoPCRFService|ACTIVE       |SUSPENDED  |SUSPENDED           |No Impact          |
+2026-11-25 00:00:00.000|20237533179|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238904697|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235464753|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20882363794|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20483440023|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20227193693|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|2035838648 |PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20238304381|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20222796478|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20233778620|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235426853|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20248262466|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20882171314|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20504673561|PRE         |ACTIVE          |_N             |SUSPENDED    |DEACTIVE     |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20482544979|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552580152|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20402580786|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20227828863|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20884800157|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20403060674|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20402482087|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20453903348|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20553959653|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20884872354|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20223763597|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20882483107|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20237203610|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20222874950|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20222523086|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20952422277|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20502050837|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20504783851|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20237283288|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20963228610|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20244731552|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20224092705|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20403555461|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235624040|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20884691446|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20472558656|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20503437797|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20552276073|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20552384093|PRE         |ACTIVE          |_N             |ACTIVE       |ACTIVE       |_N         |                    |Revenue Loss       |
+2026-11-25 00:00:00.000|20472980086|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20133311868|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20403345647|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20225519638|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20246122705|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20974790196|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20553519436|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20504690521|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20952245691|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20220298740|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20572240067|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20863896398|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20224315576|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20822146080|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20554370281|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20225508118|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20932795231|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20504453100|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20246126748|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20962740784|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20244759205|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20235438874|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20237264698|PRE         |ACTIVE          |_N             |SUSPENDED    |ACTIVE       |_N         |                    |No Impact          |
+2026-11-25 00:00:00.000|20972428089|PRE         |NoAutoActivation|ACTIVE         |ACTIVE       |ACTIVE       |ACTIVE     |                    |No Impact          |
+2026-11-25 00:00:00.000|20233631015|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20132512626|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|2035906410 |PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20246124014|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
+2026-11-25 00:00:00.000|20504620496|PRE         |ACTIVE          |SUSPENDED      |SUSPENDED    |ACTIVE       |SUSPENDED  |                    |No Impact          |
